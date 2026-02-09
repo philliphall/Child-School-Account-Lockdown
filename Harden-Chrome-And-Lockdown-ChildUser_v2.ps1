@@ -3,6 +3,7 @@
 Creates a local standard (non-Microsoft) user, ensures system-wide Google Chrome is installed, and applies hardening/lockdown.
 
 .DESCRIPTION
+GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-Lockdown.git!!!
 1) Prompts for a local child account name and creates a STANDARD local user.
 2) Ensures Google Chrome is installed system-wide. If missing, downloads the official Enterprise MSI and installs silently.
 3) Applies Chrome machine policies (HKLM) to:
@@ -11,7 +12,7 @@ Creates a local standard (non-Microsoft) user, ensures system-wide Google Chrome
    - Disable adding new profiles
    - Force browser sign-in
    - Restrict sign-in to allowed email(s)
-   - Block chrome://settings
+   - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
 
@@ -56,6 +57,10 @@ function Assert-Admin {
 
 function Ensure-RegistryKey([string]$Path) {
   if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+}
+
+function Ensure-Directory([string]$Path) {
+  if (-not (Test-Path $Path)) { New-Item -Path $Path -ItemType Directory -Force | Out-Null }
 }
 
 function Set-RegistryValue {
@@ -176,6 +181,7 @@ function Install-ChromeSystemWide {
   Invoke-WebRequest -Uri $msiUrl -OutFile $tmp -UseBasicParsing
 
   if (-not (Test-Path $tmp)) { throw 'Chrome MSI download failed.' }
+  Assert-TrustedGoogleMsi -Path $tmp
 
   Write-Host "Installing MSI silently…" -ForegroundColor DarkCyan
   $args = "/i `"$tmp`" /qn /norestart"
@@ -201,6 +207,20 @@ function Ensure-ChromeInstalled {
   Install-ChromeSystemWide
 }
 
+function Assert-TrustedGoogleMsi([string]$Path) {
+  Write-Host "Verifying MSI digital signature…" -ForegroundColor DarkCyan
+  $sig = Get-AuthenticodeSignature -FilePath $Path
+  if ($sig.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+    throw "Downloaded MSI signature is not valid. Status: $($sig.Status)"
+  }
+  if (-not $sig.SignerCertificate) {
+    throw 'Downloaded MSI has no signer certificate.'
+  }
+  if ($sig.SignerCertificate.Subject -notmatch 'Google') {
+    throw "Downloaded MSI signer is unexpected: $($sig.SignerCertificate.Subject)"
+  }
+}
+
 function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   $base = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
   Ensure-RegistryKey $base
@@ -215,16 +235,40 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   Set-RegistryValue -Path $base -Name 'BrowserAddPersonEnabled'    -Value 0 -Type DWord
   # Force browser sign-in
   Set-RegistryValue -Path $base -Name 'ForceBrowserSignin'         -Value 1 -Type DWord
+  # Browser sign-in mode (2 = force sign-in)
+  Set-RegistryValue -Path $base -Name 'BrowserSignin'              -Value 2 -Type DWord
+  # Lock down browser escape surfaces.
+  Set-RegistryValue -Path $base -Name 'DeveloperToolsAvailability' -Value 2 -Type DWord
+  Set-RegistryValue -Path $base -Name 'AutofillAddressEnabled'     -Value 0 -Type DWord
+  Set-RegistryValue -Path $base -Name 'AutofillCreditCardEnabled'  -Value 0 -Type DWord
+  Set-RegistryValue -Path $base -Name 'BlockExternalExtensions'    -Value 1 -Type DWord
 
   if ($RestrictSigninPatternRegex) {
     # Restrict to allowed account(s) using regex
     Set-RegistryValue -Path $base -Name 'RestrictSigninToPattern' -Value $RestrictSigninPatternRegex -Type String
   }
 
-  # Block settings page
+  # Block all extension installation by default.
+  $extBlock = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallBlocklist'
+  if (Test-Path $extBlock) { Remove-Item -Path $extBlock -Recurse -Force -ErrorAction SilentlyContinue }
+  Ensure-RegistryKey $extBlock
+  Set-RegistryValue -Path $extBlock -Name '1' -Value '*' -Type String
+
+  # Block high-risk internal pages.
   $urlBlock = 'HKLM:\SOFTWARE\Policies\Google\Chrome\URLBlocklist'
+  if (Test-Path $urlBlock) { Remove-Item -Path $urlBlock -Recurse -Force -ErrorAction SilentlyContinue }
   Ensure-RegistryKey $urlBlock
-  Set-RegistryValue -Path $urlBlock -Name '1' -Value 'chrome://settings' -Type String
+  $blockedUrls = @(
+    'chrome://settings*',
+    'chrome://extensions*',
+    'chrome://flags*',
+    'chrome://policy*',
+    'chrome://version*',
+    'chrome://inspect*'
+  )
+  for ($i = 0; $i -lt $blockedUrls.Count; $i++) {
+    Set-RegistryValue -Path $urlBlock -Name ($i + 1).ToString() -Value $blockedUrls[$i] -Type String
+  }
 
   Write-Host "Chrome policies written. In Chrome: open chrome://policy and click 'Reload policies'." -ForegroundColor Green
 }
@@ -244,6 +288,52 @@ function Get-UserProfilePath([string]$Sid) {
     return (Get-ItemProperty -Path $k).ProfileImagePath
   }
   return $null
+}
+
+function Apply-ChildExecutionDenyAcls([string]$Sid) {
+  $profilePath = Get-UserProfilePath $Sid
+  if (-not $profilePath -or -not (Test-Path $profilePath)) {
+    Write-Host "Skipping execute-deny ACLs because profile path is not available yet." -ForegroundColor Yellow
+    return
+  }
+
+  # Block running binaries from child-writable locations to reduce rename/copy bypasses.
+  $targets = @(
+    (Join-Path $profilePath 'Desktop'),
+    (Join-Path $profilePath 'Downloads'),
+    (Join-Path $profilePath 'Documents'),
+    (Join-Path $profilePath 'Pictures'),
+    (Join-Path $profilePath 'Music'),
+    (Join-Path $profilePath 'Videos'),
+    (Join-Path $profilePath 'AppData\Local\Temp')
+  )
+
+  foreach ($p in $targets) {
+    if (-not (Test-Path $p)) { continue }
+    Write-Host "Applying execute-deny ACL for child SID on: $p" -ForegroundColor DarkCyan
+    & icacls.exe $p /deny "*$Sid:(OI)(CI)(X)" /T /C | Out-Null
+  }
+}
+
+function Remove-ChildExecutionDenyAcls([string]$Sid) {
+  $profilePath = Get-UserProfilePath $Sid
+  if (-not $profilePath -or -not (Test-Path $profilePath)) { return }
+
+  $targets = @(
+    (Join-Path $profilePath 'Desktop'),
+    (Join-Path $profilePath 'Downloads'),
+    (Join-Path $profilePath 'Documents'),
+    (Join-Path $profilePath 'Pictures'),
+    (Join-Path $profilePath 'Music'),
+    (Join-Path $profilePath 'Videos'),
+    (Join-Path $profilePath 'AppData\Local\Temp')
+  )
+
+  foreach ($p in $targets) {
+    if (-not (Test-Path $p)) { continue }
+    Write-Host "Removing execute-deny ACL for child SID on: $p" -ForegroundColor DarkCyan
+    & icacls.exe $p /remove:d "*$Sid" /T /C | Out-Null
+  }
 }
 
 function Load-UserHive([string]$Sid) {
@@ -275,7 +365,7 @@ function Unload-UserHive {
   }
 }
 
-function Apply-UserLockdownToHive([string]$HiveRoot) {
+function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   # $HiveRoot example: HKU:\TEMP_CHILD_HIVE
 
   Write-Host "Applying per-user lockdown policies to hive: $HiveRoot" -ForegroundColor Cyan
@@ -288,6 +378,10 @@ function Apply-UserLockdownToHive([string]$HiveRoot) {
   Ensure-RegistryKey $rr
   Set-RegistryValue -Path $rr -Name '1' -Value 'chrome.exe'   -Type String
   Set-RegistryValue -Path $rr -Name '2' -Value 'StudyReel.exe' -Type String
+
+  # Reduce common shell escape vectors.
+  Set-RegistryValue -Path $expl -Name 'NoRun'     -Value 1 -Type DWord
+  Set-RegistryValue -Path $expl -Name 'NoWinKeys' -Value 1 -Type DWord
 
   # --- Block CMD ---
   $sysPol = "$HiveRoot\Software\Policies\Microsoft\Windows\System"
@@ -335,10 +429,40 @@ function Apply-UserLockdownToHive([string]$HiveRoot) {
   Ensure-RegistryKey $winExplorerPol
   Set-RegistryValue -Path $winExplorerPol -Name 'DisableSearchBoxSuggestions' -Value 1 -Type DWord
 
+  # "Don't run specified Windows applications" list for common bypass binaries.
+  Set-RegistryValue -Path $expl -Name 'DisallowRun' -Value 1 -Type DWord
+  $dr = "$expl\DisallowRun"
+  Ensure-RegistryKey $dr
+  $blockedApps = @(
+    'cmd.exe',
+    'powershell.exe',
+    'pwsh.exe',
+    'wt.exe',
+    'regedit.exe',
+    'mmc.exe',
+    'control.exe',
+    'mshta.exe',
+    'wscript.exe',
+    'cscript.exe',
+    'rundll32.exe',
+    'msiexec.exe',
+    'taskmgr.exe',
+    'notepad.exe',
+    'msedge.exe',
+    'iexplore.exe'
+  )
+  for ($i = 0; $i -lt $blockedApps.Count; $i++) {
+    Set-RegistryValue -Path $dr -Name ($i + 1).ToString() -Value $blockedApps[$i] -Type String
+  }
+
+  if ($Sid) {
+    Apply-ChildExecutionDenyAcls -Sid $Sid
+  }
+
   Write-Host "Per-user lockdown values written." -ForegroundColor Green
 }
 
-function Remove-UserLockdownFromHive([string]$HiveRoot) {
+function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
   Write-Host "Removing per-user lockdown policies from hive: $HiveRoot" -ForegroundColor Yellow
 
   $expl = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
@@ -352,7 +476,25 @@ function Remove-UserLockdownFromHive([string]$HiveRoot) {
     if (Test-Path $k) { Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue }
   }
 
+  if ($Sid) {
+    Remove-ChildExecutionDenyAcls -Sid $Sid
+  }
+
   Write-Host "Per-user lockdown keys removed (where present)." -ForegroundColor Green
+}
+
+function Ensure-SecureTaskScriptCopy([string]$SourcePath) {
+  $taskDir = Join-Path $env:ProgramData 'ChildLockdown'
+  Ensure-Directory $taskDir
+
+  $destPath = Join-Path $taskDir 'ApplyChildLockdown.ps1'
+  Copy-Item -Path $SourcePath -Destination $destPath -Force
+
+  # Lock task script path to SYSTEM + local admins only.
+  & icacls.exe $taskDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /C | Out-Null
+  & icacls.exe $destPath /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /C | Out-Null
+
+  return $destPath
 }
 
 function Ensure-FirstLogonTask([string]$ChildUserName, [string]$ChildSid) {
@@ -362,8 +504,9 @@ function Ensure-FirstLogonTask([string]$ChildUserName, [string]$ChildSid) {
   $taskName = "ApplyChildLockdown_$ChildUserName"
   $scriptPath = $PSCommandPath
   if (-not $scriptPath) { throw "Cannot determine script path. Save this script to disk and rerun." }
+  $taskScriptPath = Ensure-SecureTaskScriptCopy -SourcePath $scriptPath
 
-  $args = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -InternalApplyUserLockdown -InternalUserSid `"$ChildSid`""
+  $args = "-NoProfile -ExecutionPolicy Bypass -File `"$taskScriptPath`" -InternalApplyUserLockdown -InternalUserSid `"$ChildSid`""
 
   # Delete existing
   & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
@@ -383,7 +526,7 @@ function Internal-ApplyUserLockdown([string]$Sid) {
       Write-Host "User hive not available yet (profile not created)." -ForegroundColor Yellow
       return
     }
-    Apply-UserLockdownToHive $hive
+    Apply-UserLockdownToHive -HiveRoot $hive -Sid $Sid
   } finally {
     Unload-UserHive
   }
@@ -415,7 +558,7 @@ if ($RemoveUserLockdown) {
       Write-Host "Cannot load hive now. Have the user sign in once to create the profile, then rerun." -ForegroundColor Yellow
       return
     }
-    Remove-UserLockdownFromHive $hive
+    Remove-UserLockdownFromHive -HiveRoot $hive -Sid $sid
   } finally {
     Unload-UserHive
   }
@@ -463,7 +606,7 @@ $hive = $null
 try {
   $hive = Load-UserHive $sid
   if ($hive) {
-    Apply-UserLockdownToHive $hive
+    Apply-UserLockdownToHive -HiveRoot $hive -Sid $sid
   } else {
     Write-Host "User profile hive not found yet. The child must sign in once to create the profile." -ForegroundColor Yellow
     Write-Host "A logon task will be created so lockdown is applied automatically at first sign-in." -ForegroundColor Yellow
