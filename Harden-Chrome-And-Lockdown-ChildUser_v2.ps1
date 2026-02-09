@@ -764,6 +764,13 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   $sys = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Policies\System"
   Set-RegistryValue -Path $sys -Name 'DisableRegistryTools' -Value 1 -Type DWord
 
+  # --- Enforce lock screen on idle + password on resume ---
+  $desktopPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Control Panel\Desktop"
+  Set-RegistryValue -Path $desktopPol -Name 'ScreenSaveActive'    -Value '1'   -Type String
+  Set-RegistryValue -Path $desktopPol -Name 'ScreenSaverIsSecure' -Value '1'   -Type String
+  Set-RegistryValue -Path $desktopPol -Name 'ScreenSaveTimeOut'   -Value '300' -Type String
+  Set-RegistryValue -Path $desktopPol -Name 'SCRNSAVE.EXE'        -Value (Join-Path $env:WINDIR 'System32\scrnsave.scr') -Type String
+
   # --- Start Menu / Taskbar restrictions ---
   # Remove all programs list
   Set-RegistryValue -Path $expl -Name 'NoStartMenuMorePrograms' -Value 1 -Type DWord
@@ -843,11 +850,12 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
   $expl = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
   $sysPol = "$HiveRoot\Software\Policies\Microsoft\Windows\System"
   $sys = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+  $desktopPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Control Panel\Desktop"
   $store = "$HiveRoot\Software\Policies\Microsoft\WindowsStore"
   $winExplorerPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Explorer"
 
   # Remove the keys we created (best-effort)
-  foreach ($k in @($expl, "$expl\RestrictRun", $sysPol, $sys, $store, $winExplorerPol)) {
+  foreach ($k in @($expl, "$expl\RestrictRun", $sysPol, $sys, $desktopPol, $store, $winExplorerPol)) {
     if (Test-Path $k) { Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue }
   }
 
@@ -1048,7 +1056,6 @@ try {
   Write-Host "Next steps (manual):" -ForegroundColor Cyan
   Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
   Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
-  Write-Host "3) (Optional) Clean desktop icons / hide Recycle Bin using Personalization as desired." -ForegroundColor Cyan
   Write-Host "`nRollback:" -ForegroundColor Yellow
   Write-Host "- Remove Chrome policies:   .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveChromePolicies" -ForegroundColor Yellow
   Write-Host "- Remove user lockdown:     .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveUserLockdown -UserName <name>" -ForegroundColor Yellow
