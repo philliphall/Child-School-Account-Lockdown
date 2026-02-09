@@ -16,8 +16,8 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
 5) Applies shell cleanup for the child:
-   - Removes non-Chrome desktop shortcuts from the child desktop and Public desktop
-   - Resets taskbar pin store to Chrome-only (best-effort)
+   - Removes desktop shortcuts except approved apps (Chrome + StudyReel) from child/Public desktop
+   - Resets taskbar pin store to approved apps (Chrome + StudyReel, if installed) (best-effort)
    - Sets Chrome to auto-start at child sign-in
 
 SAFETY
@@ -373,49 +373,76 @@ function Get-ChromeExecutablePath {
   return $null
 }
 
-function New-ChromeShortcut([string]$ShortcutPath, [string]$ChromeExePath) {
+function New-ExeShortcut([string]$ShortcutPath, [string]$ExePath) {
   Ensure-Directory (Split-Path -Parent $ShortcutPath)
   try {
     $wsh = New-Object -ComObject WScript.Shell
     $sc = $wsh.CreateShortcut($ShortcutPath)
-    $sc.TargetPath = $ChromeExePath
-    $sc.WorkingDirectory = Split-Path -Parent $ChromeExePath
-    $sc.IconLocation = "$ChromeExePath,0"
+    $sc.TargetPath = $ExePath
+    $sc.WorkingDirectory = Split-Path -Parent $ExePath
+    $sc.IconLocation = "$ExePath,0"
     $sc.Save()
   } catch {
     Write-Host "Warning: could not create shortcut ${ShortcutPath}: $($_.Exception.Message)" -ForegroundColor Yellow
   }
 }
 
-function Test-ShortcutLooksLikeChrome([string]$ShortcutPath, [string]$ChromeExePath) {
+function Get-StudyReelExecutablePath([string]$ProfilePath) {
+  $patterns = @()
+  if ($env:ProgramFiles) {
+    $patterns += (Join-Path $env:ProgramFiles 'StudyReel\StudyReel.exe')
+    $patterns += (Join-Path $env:ProgramFiles 'StudyReel\*\StudyReel.exe')
+  }
+  if (${env:ProgramFiles(x86)}) {
+    $patterns += (Join-Path ${env:ProgramFiles(x86)} 'StudyReel\StudyReel.exe')
+    $patterns += (Join-Path ${env:ProgramFiles(x86)} 'StudyReel\*\StudyReel.exe')
+  }
+  if ($ProfilePath) {
+    $patterns += (Join-Path $ProfilePath 'AppData\Local\Programs\StudyReel\StudyReel.exe')
+    $patterns += (Join-Path $ProfilePath 'AppData\Local\StudyReel\StudyReel.exe')
+  }
+
+  foreach ($pat in $patterns) {
+    $hit = Get-ChildItem -Path $pat -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit -and (Test-Path $hit.FullName)) { return $hit.FullName }
+  }
+  return $null
+}
+
+function Test-ShortcutLooksLikeApprovedApp([string]$ShortcutPath, [string]$ChromeExePath, [string]$StudyReelExePath) {
   if (-not (Test-Path $ShortcutPath)) { return $false }
   $name = [IO.Path]::GetFileNameWithoutExtension($ShortcutPath)
-  if ($name -match '(?i)chrome') { return $true }
+  if ($name -match '(?i)(chrome|study\s*reel|studyreel)') { return $true }
 
   if ($ShortcutPath -like '*.lnk') {
     try {
       $wsh = New-Object -ComObject WScript.Shell
       $sc = $wsh.CreateShortcut($ShortcutPath)
-      if ($sc.TargetPath -and $ChromeExePath -and ($sc.TargetPath -ieq $ChromeExePath)) { return $true }
+      if (-not $sc.TargetPath) { return $false }
+      if ($ChromeExePath -and ($sc.TargetPath -ieq $ChromeExePath)) { return $true }
+      if ($StudyReelExePath -and ($sc.TargetPath -ieq $StudyReelExePath)) { return $true }
+
+      $leaf = [IO.Path]::GetFileName($sc.TargetPath)
+      if ($leaf -match '^(?i)(chrome\.exe|studyreel\.exe)$') { return $true }
     } catch {}
   }
   return $false
 }
 
-function Remove-NonChromeDesktopShortcuts([string]$DesktopPath, [string]$ChromeExePath) {
+function Remove-NonApprovedDesktopShortcuts([string]$DesktopPath, [string]$ChromeExePath, [string]$StudyReelExePath) {
   if (-not $DesktopPath -or -not (Test-Path $DesktopPath)) { return }
 
   $shortcutFiles = @(Get-ChildItem -Path $DesktopPath -File -ErrorAction SilentlyContinue | Where-Object {
     $_.Extension -in @('.lnk', '.url', '.appref-ms')
   })
   foreach ($f in $shortcutFiles) {
-    if (Test-ShortcutLooksLikeChrome -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath) { continue }
+    if (Test-ShortcutLooksLikeApprovedApp -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath -StudyReelExePath $StudyReelExePath) { continue }
     Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
   }
 }
 
-function Reset-TaskbarPinsToChromeOnly([string]$ProfilePath, [string]$HiveRoot, [string]$ChromeExePath) {
-  # Best-effort: clear pin stores and seed Chrome as the only pinned shortcut.
+function Reset-TaskbarPinsToApprovedApps([string]$ProfilePath, [string]$HiveRoot, [string]$ChromeExePath, [string]$StudyReelExePath) {
+  # Best-effort: clear pin stores and seed approved app shortcuts.
   if (-not $ProfilePath -or -not (Test-Path $ProfilePath)) { return }
 
   $pinnedRoot = Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned'
@@ -429,7 +456,11 @@ function Reset-TaskbarPinsToChromeOnly([string]$ProfilePath, [string]$HiveRoot, 
   Ensure-Directory $taskbarPinned
 
   $taskbarChromeShortcut = Join-Path $taskbarPinned 'Google Chrome.lnk'
-  New-ChromeShortcut -ShortcutPath $taskbarChromeShortcut -ChromeExePath $ChromeExePath
+  New-ExeShortcut -ShortcutPath $taskbarChromeShortcut -ExePath $ChromeExePath
+  if ($StudyReelExePath -and (Test-Path $StudyReelExePath)) {
+    $taskbarStudyReelShortcut = Join-Path $taskbarPinned 'StudyReel.lnk'
+    New-ExeShortcut -ShortcutPath $taskbarStudyReelShortcut -ExePath $StudyReelExePath
+  }
 
   $taskband = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
   if (Test-Path $taskband) {
@@ -459,13 +490,17 @@ function Apply-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
 
   $childDesktop = Join-Path $profilePath 'Desktop'
   $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
+  $studyReelExe = Get-StudyReelExecutablePath -ProfilePath $profilePath
 
-  # Remove public and per-user shortcuts except Chrome, then ensure a Chrome desktop shortcut exists.
-  Remove-NonChromeDesktopShortcuts -DesktopPath $publicDesktop -ChromeExePath $chromeExe
-  Remove-NonChromeDesktopShortcuts -DesktopPath $childDesktop -ChromeExePath $chromeExe
-  New-ChromeShortcut -ShortcutPath (Join-Path $childDesktop 'Google Chrome.lnk') -ChromeExePath $chromeExe
+  # Remove public and per-user shortcuts except approved apps, then ensure Chrome shortcut exists.
+  Remove-NonApprovedDesktopShortcuts -DesktopPath $publicDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
+  Remove-NonApprovedDesktopShortcuts -DesktopPath $childDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
+  New-ExeShortcut -ShortcutPath (Join-Path $childDesktop 'Google Chrome.lnk') -ExePath $chromeExe
+  if ($studyReelExe -and (Test-Path $studyReelExe)) {
+    New-ExeShortcut -ShortcutPath (Join-Path $childDesktop 'StudyReel.lnk') -ExePath $studyReelExe
+  }
 
-  Reset-TaskbarPinsToChromeOnly -ProfilePath $profilePath -HiveRoot $HiveRoot -ChromeExePath $chromeExe
+  Reset-TaskbarPinsToApprovedApps -ProfilePath $profilePath -HiveRoot $HiveRoot -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
 }
 
 function Remove-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
