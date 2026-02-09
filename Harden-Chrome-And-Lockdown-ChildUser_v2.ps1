@@ -131,10 +131,11 @@ function Create-LocalStandardUser([string]$Name) {
 }
 
 function Test-ChromeSystemWideInstalled {
-  $paths = @(
-    Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe',
-    Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'
-  )
+  $paths = @()
+  $pf = $env:ProgramFiles
+  $pf86 = ${env:ProgramFiles(x86)}
+  if ($pf)  { $paths += Join-Path $pf  'Google\Chrome\Application\chrome.exe' }
+  if ($pf86) { $paths += Join-Path $pf86 'Google\Chrome\Application\chrome.exe' }
   foreach ($p in $paths) {
     if ($p -and (Test-Path $p)) { return $true }
   }
@@ -157,7 +158,7 @@ function Test-ChromeSystemWideInstalled {
 }
 
 function Install-ChromeSystemWide {
-  Write-Host "System-wide Chrome not detected. Downloading + installing…" -ForegroundColor Cyan
+  Write-Host "System-wide Chrome not detected. Downloading + installing..." -ForegroundColor Cyan
 
   # Official Google Enterprise MSI direct links (commonly used for managed deployments)
   # 64-bit: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
@@ -183,7 +184,7 @@ function Install-ChromeSystemWide {
   if (-not (Test-Path $tmp)) { throw 'Chrome MSI download failed.' }
   Assert-TrustedGoogleMsi -Path $tmp
 
-  Write-Host "Installing MSI silently…" -ForegroundColor DarkCyan
+  Write-Host "Installing MSI silently..." -ForegroundColor DarkCyan
   $args = "/i `"$tmp`" /qn /norestart"
   $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $args -Wait -PassThru
   if ($p.ExitCode -ne 0) {
@@ -208,7 +209,7 @@ function Ensure-ChromeInstalled {
 }
 
 function Assert-TrustedGoogleMsi([string]$Path) {
-  Write-Host "Verifying MSI digital signature…" -ForegroundColor DarkCyan
+  Write-Host "Verifying MSI digital signature..." -ForegroundColor DarkCyan
   $sig = Get-AuthenticodeSignature -FilePath $Path
   if ($sig.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
     throw "Downloaded MSI signature is not valid. Status: $($sig.Status)"
@@ -225,7 +226,7 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   $base = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
   Ensure-RegistryKey $base
 
-  Write-Host "Applying Chrome hardening policies (machine-wide)…" -ForegroundColor Cyan
+  Write-Host "Applying Chrome hardening policies (machine-wide)..." -ForegroundColor Cyan
 
   # Disable Guest
   Set-RegistryValue -Path $base -Name 'BrowserGuestModeEnabled'    -Value 0 -Type DWord
@@ -274,7 +275,7 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
 }
 
 function Remove-ChromeHardening {
-  Write-Host "Removing Chrome hardening policies…" -ForegroundColor Yellow
+  Write-Host "Removing Chrome hardening policies..." -ForegroundColor Yellow
   $base = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
   if (Test-Path $base) {
     Remove-Item -Path $base -Recurse -Force -ErrorAction SilentlyContinue
@@ -311,7 +312,7 @@ function Apply-ChildExecutionDenyAcls([string]$Sid) {
   foreach ($p in $targets) {
     if (-not (Test-Path $p)) { continue }
     Write-Host "Applying execute-deny ACL for child SID on: $p" -ForegroundColor DarkCyan
-    & icacls.exe $p /deny "*$Sid:(OI)(CI)(X)" /T /C | Out-Null
+    & icacls.exe $p /deny "*${Sid}:(OI)(CI)(X)" /T /C | Out-Null
   }
 }
 
@@ -360,7 +361,7 @@ function Load-UserHive([string]$Sid) {
 function Unload-UserHive {
   $mountPath = 'Registry::HKEY_USERS\TEMP_CHILD_HIVE'
   if (Test-Path $mountPath) {
-    Write-Host "Unloading user hive…" -ForegroundColor DarkCyan
+    Write-Host "Unloading user hive..." -ForegroundColor DarkCyan
     & reg.exe unload 'HKU\TEMP_CHILD_HIVE' | Out-Null
   }
 }
@@ -508,11 +509,52 @@ function Ensure-FirstLogonTask([string]$ChildUserName, [string]$ChildSid) {
 
   $args = "-NoProfile -ExecutionPolicy Bypass -File `"$taskScriptPath`" -InternalApplyUserLockdown -InternalUserSid `"$ChildSid`""
 
-  # Delete existing
-  & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+  # Resolve schtasks path (handle Sysnative when running 32-bit PowerShell on 64-bit Windows)
+  $schtasksPath = "$env:windir\Sysnative\schtasks.exe"
+  if (-not (Test-Path $schtasksPath)) {
+    $schtasksPath = "$env:windir\System32\schtasks.exe"
+  }
+  if (-not (Test-Path $schtasksPath)) {
+    $schtasksPath = 'schtasks.exe'
+  }
 
-  # Create
-  & schtasks.exe /Create /TN $taskName /SC ONLOGON /RU SYSTEM /RL HIGHEST /TR "powershell.exe $args" /F | Out-Null
+  # If resolved path doesn't exist, fall back to PATH resolution and warn
+  if (($schtasksPath -ne 'schtasks.exe') -and -not (Test-Path $schtasksPath)) {
+    Write-Host "schtasks not found at $schtasksPath; falling back to PATH resolution." -ForegroundColor Yellow
+    $schtasksPath = 'schtasks.exe'
+  }
+  # Prefer ScheduledTasks cmdlets (clean) with a schtasks.exe fallback for older systems
+  if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
+    try {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+
+      $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $ChildUserName
+      $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop
+    } catch {
+      throw "Failed to create scheduled task using ScheduledTasks cmdlets: $($_.Exception.Message)"
+    }
+  } else {
+    # Delete existing (best-effort)
+    try {
+      Start-Process -FilePath $schtasksPath -ArgumentList '/Delete','/TN',$taskName,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop | Out-Null
+    } catch {
+      Write-Host "Existing task delete attempted but failed (may not exist): $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # Create the task using schtasks.exe
+    try {
+      $trCmd = "powershell.exe $args"
+      $trArg = '"' + $trCmd + '"'
+      Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU','SYSTEM','/RL','HIGHEST','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop | Out-Null
+    } catch {
+      throw "Failed to create scheduled task via ${schtasksPath}: $($_.Exception.Message)"
+    }
+  }
 
   Write-Host "Created logon task '$taskName' to apply user lockdown at first sign-in." -ForegroundColor Green
 }
@@ -568,19 +610,19 @@ if ($RemoveUserLockdown) {
 }
 
 # Interactive flow
-$childUser = Read-Host 'Enter LOCAL child account name to create (e.g., R4)'
+$childUser = Read-Host 'Enter LOCAL child account name to create (e.g., Student01)'
 if (-not $childUser) { throw 'Username cannot be empty.' }
 
 Ensure-ChromeInstalled
 Create-LocalStandardUser -Name $childUser
 
 # Chrome RestrictSigninToPattern
-Write-Host "\nChrome sign-in restriction:" -ForegroundColor Cyan
+Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
 Write-Host "Enter allowed child email(s). Separate multiple emails with commas." -ForegroundColor Cyan
 $emailsRaw = Read-Host 'Allowed email(s)'
 $emails = @()
 if ($emailsRaw) {
-  $emails = $emailsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+  $emails = @($emailsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
 $pattern = $null
@@ -601,7 +643,7 @@ Apply-ChromeHardening -RestrictSigninPatternRegex $pattern
 $sid = Get-LocalUserSid $childUser
 if (-not $sid) { throw "Could not resolve SID for '$childUser'" }
 
-Write-Host "\nApplying Windows per-user lockdown for '$childUser'…" -ForegroundColor Cyan
+Write-Host "`nApplying Windows per-user lockdown for '$childUser'..." -ForegroundColor Cyan
 $hive = $null
 try {
   $hive = Load-UserHive $sid
@@ -616,11 +658,11 @@ try {
   Unload-UserHive
 }
 
-Write-Host "\nDONE." -ForegroundColor Green
+Write-Host "`nDONE." -ForegroundColor Green
 Write-Host "Next steps (manual):" -ForegroundColor Cyan
 Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
 Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
 Write-Host "3) (Optional) Clean desktop icons / hide Recycle Bin using Personalization as desired." -ForegroundColor Cyan
-Write-Host "\nRollback:" -ForegroundColor Yellow
+Write-Host "`nRollback:" -ForegroundColor Yellow
 Write-Host "- Remove Chrome policies:   .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveChromePolicies" -ForegroundColor Yellow
 Write-Host "- Remove user lockdown:     .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveUserLockdown -UserName <name>" -ForegroundColor Yellow
