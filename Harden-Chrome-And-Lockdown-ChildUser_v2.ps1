@@ -15,6 +15,10 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
+5) Applies shell cleanup for the child:
+   - Removes non-Chrome desktop shortcuts from the child desktop and Public desktop
+   - Resets taskbar pin store to Chrome-only (best-effort)
+   - Sets Chrome to auto-start at child sign-in
 
 SAFETY
 - Does NOT modify Administrator account.
@@ -357,6 +361,120 @@ function Ensure-ChromeInstalled {
   Install-ChromeSystemWide
 }
 
+function Get-ChromeExecutablePath {
+  $paths = @()
+  $pf = $env:ProgramFiles
+  $pf86 = ${env:ProgramFiles(x86)}
+  if ($pf) { $paths += Join-Path $pf 'Google\Chrome\Application\chrome.exe' }
+  if ($pf86) { $paths += Join-Path $pf86 'Google\Chrome\Application\chrome.exe' }
+  foreach ($p in $paths) {
+    if ($p -and (Test-Path $p)) { return $p }
+  }
+  return $null
+}
+
+function New-ChromeShortcut([string]$ShortcutPath, [string]$ChromeExePath) {
+  Ensure-Directory (Split-Path -Parent $ShortcutPath)
+  try {
+    $wsh = New-Object -ComObject WScript.Shell
+    $sc = $wsh.CreateShortcut($ShortcutPath)
+    $sc.TargetPath = $ChromeExePath
+    $sc.WorkingDirectory = Split-Path -Parent $ChromeExePath
+    $sc.IconLocation = "$ChromeExePath,0"
+    $sc.Save()
+  } catch {
+    Write-Host "Warning: could not create shortcut ${ShortcutPath}: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Test-ShortcutLooksLikeChrome([string]$ShortcutPath, [string]$ChromeExePath) {
+  if (-not (Test-Path $ShortcutPath)) { return $false }
+  $name = [IO.Path]::GetFileNameWithoutExtension($ShortcutPath)
+  if ($name -match '(?i)chrome') { return $true }
+
+  if ($ShortcutPath -like '*.lnk') {
+    try {
+      $wsh = New-Object -ComObject WScript.Shell
+      $sc = $wsh.CreateShortcut($ShortcutPath)
+      if ($sc.TargetPath -and $ChromeExePath -and ($sc.TargetPath -ieq $ChromeExePath)) { return $true }
+    } catch {}
+  }
+  return $false
+}
+
+function Remove-NonChromeDesktopShortcuts([string]$DesktopPath, [string]$ChromeExePath) {
+  if (-not $DesktopPath -or -not (Test-Path $DesktopPath)) { return }
+
+  $shortcutFiles = @(Get-ChildItem -Path $DesktopPath -File -ErrorAction SilentlyContinue | Where-Object {
+    $_.Extension -in @('.lnk', '.url', '.appref-ms')
+  })
+  foreach ($f in $shortcutFiles) {
+    if (Test-ShortcutLooksLikeChrome -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath) { continue }
+    Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Reset-TaskbarPinsToChromeOnly([string]$ProfilePath, [string]$HiveRoot, [string]$ChromeExePath) {
+  # Best-effort: clear pin stores and seed Chrome as the only pinned shortcut.
+  if (-not $ProfilePath -or -not (Test-Path $ProfilePath)) { return }
+
+  $pinnedRoot = Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned'
+  $taskbarPinned = Join-Path $pinnedRoot 'TaskBar'
+
+  if (Test-Path $pinnedRoot) {
+    Get-ChildItem -Path $pinnedRoot -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Ensure-Directory $taskbarPinned
+
+  $taskbarChromeShortcut = Join-Path $taskbarPinned 'Google Chrome.lnk'
+  New-ChromeShortcut -ShortcutPath $taskbarChromeShortcut -ChromeExePath $ChromeExePath
+
+  $taskband = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+  if (Test-Path $taskband) {
+    Remove-Item -Path $taskband -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Apply-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
+  if (-not $Sid) { return }
+
+  $chromeExe = Get-ChromeExecutablePath
+  if (-not $chromeExe) {
+    Write-Host "Warning: Chrome executable path not found. Skipping shell/icon cleanup." -ForegroundColor Yellow
+    return
+  }
+
+  # Autostart Chrome for the child at each sign-in.
+  $runPath = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Run"
+  $runCmd = "`"$chromeExe`" --no-first-run --start-maximized"
+  Set-RegistryValue -Path $runPath -Name 'ChildLockdownStartChrome' -Value $runCmd -Type String
+
+  $profilePath = Get-UserProfilePath $Sid
+  if (-not $profilePath -or -not (Test-Path $profilePath)) {
+    Write-Host "Profile path unavailable; shell cleanup will run on the next successful profile load." -ForegroundColor Yellow
+    return
+  }
+
+  $childDesktop = Join-Path $profilePath 'Desktop'
+  $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
+
+  # Remove public and per-user shortcuts except Chrome, then ensure a Chrome desktop shortcut exists.
+  Remove-NonChromeDesktopShortcuts -DesktopPath $publicDesktop -ChromeExePath $chromeExe
+  Remove-NonChromeDesktopShortcuts -DesktopPath $childDesktop -ChromeExePath $chromeExe
+  New-ChromeShortcut -ShortcutPath (Join-Path $childDesktop 'Google Chrome.lnk') -ChromeExePath $chromeExe
+
+  Reset-TaskbarPinsToChromeOnly -ProfilePath $profilePath -HiveRoot $HiveRoot -ChromeExePath $chromeExe
+}
+
+function Remove-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
+  $runPath = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Run"
+  if (Test-Path $runPath) {
+    Remove-ItemProperty -Path $runPath -Name 'ChildLockdownStartChrome' -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Assert-TrustedGoogleMsi([string]$Path) {
   Write-Host "Verifying MSI digital signature..." -ForegroundColor DarkCyan
   $sig = Get-AuthenticodeSignature -FilePath $Path
@@ -657,6 +775,8 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   Set-RegistryValue -Path $expl -Name 'NoFind'                 -Value 1 -Type DWord
   # Remove pinned programs list
   Set-RegistryValue -Path $expl -Name 'NoStartMenuPinnedList'  -Value 1 -Type DWord
+  # Do not allow pinning changes on taskbar.
+  Set-RegistryValue -Path $expl -Name 'NoPinningToTaskbar'     -Value 1 -Type DWord
 
   # --- Disable Store ---
   $store = "$HiveRoot\Software\Policies\Microsoft\WindowsStore"
@@ -711,6 +831,7 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
 
   if ($Sid) {
     Apply-ChildExecutionDenyAcls -Sid $Sid
+    Apply-ChildShellSurfaceLockdown -HiveRoot $HiveRoot -Sid $Sid
   }
 
   Write-Host "Per-user lockdown values written." -ForegroundColor Green
@@ -732,6 +853,7 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
 
   if ($Sid) {
     Remove-ChildExecutionDenyAcls -Sid $Sid
+    Remove-ChildShellSurfaceLockdown -HiveRoot $HiveRoot -Sid $Sid
   }
 
   Write-Host "Per-user lockdown keys removed (where present)." -ForegroundColor Green
