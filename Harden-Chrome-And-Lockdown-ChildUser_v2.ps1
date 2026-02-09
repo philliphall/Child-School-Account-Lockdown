@@ -46,6 +46,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:TranscriptStartedByScript = $false
 
 function Assert-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -61,6 +62,51 @@ function Ensure-RegistryKey([string]$Path) {
 
 function Ensure-Directory([string]$Path) {
   if (-not (Test-Path $Path)) { New-Item -Path $Path -ItemType Directory -Force | Out-Null }
+}
+
+function Ensure-SecureChildLockdownRoot {
+  $root = Join-Path $env:ProgramData 'ChildLockdown'
+  Ensure-Directory $root
+  & icacls.exe $root /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /C | Out-Null
+  return $root
+}
+
+function Start-SecureTranscriptLogging {
+  $root = Ensure-SecureChildLockdownRoot
+  $logDir = Join-Path $root 'Logs'
+  Ensure-Directory $logDir
+  & icacls.exe $logDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /C | Out-Null
+
+  $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $mode = if ($InternalApplyUserLockdown) {
+    'internal_lockdown'
+  } elseif ($RemoveChromePolicies) {
+    'remove_chrome_policies'
+  } elseif ($RemoveUserLockdown) {
+    'remove_user_lockdown'
+  } else {
+    'interactive'
+  }
+  $logPath = Join-Path $logDir ("Lockdown_{0}_{1}.log" -f $mode, $ts)
+
+  try {
+    Start-Transcript -Path $logPath -Append -Force | Out-Null
+    $script:TranscriptStartedByScript = $true
+    Write-Host "Transcript started: $logPath" -ForegroundColor DarkCyan
+  } catch {
+    Write-Host "Warning: could not start transcript logging: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Stop-SecureTranscriptLogging {
+  if (-not $script:TranscriptStartedByScript) { return }
+  try {
+    Stop-Transcript | Out-Null
+  } catch {
+    Write-Host "Warning: could not stop transcript cleanly: $($_.Exception.Message)" -ForegroundColor Yellow
+  } finally {
+    $script:TranscriptStartedByScript = $false
+  }
 }
 
 function Set-RegistryValue {
@@ -128,6 +174,109 @@ function Create-LocalStandardUser([string]$Name) {
   try { Add-LocalGroupMember -Group 'Users' -Member $Name -ErrorAction SilentlyContinue } catch {}
 
   Write-Host "User '$Name' created as a standard local user." -ForegroundColor Green
+}
+
+function Get-LocalAdministratorsMemberSids {
+  $adminSids = New-Object 'System.Collections.Generic.HashSet[string]'
+
+  $adminGroup = $null
+  try {
+    $adminGroup = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction Stop
+  } catch {
+    $adminGroup = Get-LocalGroup -Name 'Administrators' -ErrorAction Stop
+  }
+
+  $members = @(Get-LocalGroupMember -Group $adminGroup.Name -ErrorAction SilentlyContinue)
+  foreach ($m in $members) {
+    if ($m.SID -and $m.SID.Value) {
+      [void]$adminSids.Add($m.SID.Value)
+    }
+  }
+
+  return $adminSids
+}
+
+function Test-LocalUserIsAdmin([string]$Name) {
+  $sid = Get-LocalUserSid $Name
+  if (-not $sid) { return $false }
+  $adminSids = Get-LocalAdministratorsMemberSids
+  return $adminSids.Contains($sid)
+}
+
+function Get-EligibleExistingChildUsers {
+  $excluded = @('Administrator', 'DefaultAccount', 'Guest', 'WDAGUtilityAccount')
+  $adminSids = Get-LocalAdministratorsMemberSids
+
+  $users = @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -and $_.Enabled -and ($excluded -notcontains $_.Name)
+  } | Sort-Object Name)
+
+  $result = @()
+  foreach ($u in $users) {
+    $sid = Get-LocalUserSid $u.Name
+    if (-not $sid) { continue }
+    if ($adminSids.Contains($sid)) { continue }
+    $result += $u.Name
+  }
+
+  return $result
+}
+
+function Prompt-ChildUserSelection {
+  Write-Host "`nChild account selection:" -ForegroundColor Cyan
+  $existing = @(Get-EligibleExistingChildUsers)
+
+  if ($existing.Count -gt 0) {
+    Write-Host "Choose an existing non-admin local account to harden, or create a new one." -ForegroundColor Cyan
+    for ($i = 0; $i -lt $existing.Count; $i++) {
+      Write-Host ("{0}) {1}" -f ($i + 1), $existing[$i]) -ForegroundColor Cyan
+    }
+    $createIndex = $existing.Count + 1
+    Write-Host ("{0}) Create new local standard user" -f $createIndex) -ForegroundColor Cyan
+
+    while ($true) {
+      $choice = Read-Host ("Select option (1-{0})" -f $createIndex)
+      if ($choice -match '^\d+$') {
+        $idx = [int]$choice
+        if (($idx -ge 1) -and ($idx -le $existing.Count)) {
+          return [PSCustomObject]@{
+            UserName  = $existing[$idx - 1]
+            CreateNew = $false
+          }
+        }
+        if ($idx -eq $createIndex) { break }
+      }
+      Write-Host ("Invalid choice. Enter a number from 1 to {0}." -f $createIndex) -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host "No eligible existing non-admin local accounts were found. Creating a new account." -ForegroundColor Yellow
+  }
+
+  while ($true) {
+    $name = Read-Host 'Enter LOCAL child account name to create (e.g., Student01)'
+    if ([string]::IsNullOrWhiteSpace($name)) {
+      Write-Host 'Username cannot be empty.' -ForegroundColor Yellow
+      continue
+    }
+
+    $existingUser = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+    if ($existingUser) {
+      if (Test-LocalUserIsAdmin -Name $name) {
+        Write-Host "User '$name' is an administrator. Choose a different account name." -ForegroundColor Yellow
+        continue
+      }
+      Write-Host "User '$name' already exists and is non-admin; selecting it." -ForegroundColor Yellow
+      return [PSCustomObject]@{
+        UserName  = $name
+        CreateNew = $false
+      }
+    }
+
+    return [PSCustomObject]@{
+      UserName  = $name
+      CreateNew = $true
+    }
+  }
 }
 
 function Test-ChromeSystemWideInstalled {
@@ -337,37 +486,141 @@ function Remove-ChildExecutionDenyAcls([string]$Sid) {
   }
 }
 
-function Load-UserHive([string]$Sid) {
-  # Returns mount point like HKU:\TEMP_CHILD_HIVE
+function Resolve-UserHiveAccess([string]$Sid) {
+  # Prefer the live HKEY_USERS\<SID> hive if already loaded (common during interactive sign-in).
+  $liveMountPath = "Registry::HKEY_USERS\$Sid"
+  if (Test-Path $liveMountPath) {
+    return [PSCustomObject]@{
+      HiveRoot           = "Registry::HKEY_USERS\$Sid"
+      TempHiveName       = $null
+      LoadedByThisScript = $false
+    }
+  }
+
   $profilePath = Get-UserProfilePath $Sid
   if (-not $profilePath) { return $null }
 
   $ntuser = Join-Path $profilePath 'NTUSER.DAT'
   if (-not (Test-Path $ntuser)) { return $null }
 
-  $mountName = 'TEMP_CHILD_HIVE'
+  $mountName = 'TEMP_CHILD_HIVE_{0}' -f ($Sid -replace '[^A-Za-z0-9]', '_')
   $mountPath = "Registry::HKEY_USERS\$mountName"
 
-  # If already loaded, reuse
   if (Test-Path $mountPath) {
-    return "HKU:\$mountName"
+    return [PSCustomObject]@{
+      HiveRoot           = "Registry::HKEY_USERS\$mountName"
+      TempHiveName       = $mountName
+      LoadedByThisScript = $false
+    }
   }
 
   Write-Host "Loading user hive from $ntuser" -ForegroundColor DarkCyan
   & reg.exe load "HKU\$mountName" "$ntuser" | Out-Null
-  return "HKU:\$mountName"
-}
+  if (($LASTEXITCODE -ne 0) -or -not (Test-Path $mountPath)) {
+    # If profile just finished loading after task start, fallback to live SID hive.
+    if (Test-Path $liveMountPath) {
+      return [PSCustomObject]@{
+        HiveRoot           = "Registry::HKEY_USERS\$Sid"
+        TempHiveName       = $null
+        LoadedByThisScript = $false
+      }
+    }
+    Write-Host "Failed to load user hive for SID $Sid." -ForegroundColor Yellow
+    return $null
+  }
 
-function Unload-UserHive {
-  $mountPath = 'Registry::HKEY_USERS\TEMP_CHILD_HIVE'
-  if (Test-Path $mountPath) {
-    Write-Host "Unloading user hive..." -ForegroundColor DarkCyan
-    & reg.exe unload 'HKU\TEMP_CHILD_HIVE' | Out-Null
+  return [PSCustomObject]@{
+    HiveRoot           = "Registry::HKEY_USERS\$mountName"
+    TempHiveName       = $mountName
+    LoadedByThisScript = $true
   }
 }
 
+function Close-UserHiveAccess($HiveAccess) {
+  if (-not $HiveAccess) { return }
+  if (-not $HiveAccess.LoadedByThisScript) { return }
+  if (-not $HiveAccess.TempHiveName) { return }
+
+  $mountPath = "Registry::HKEY_USERS\$($HiveAccess.TempHiveName)"
+  if (-not (Test-Path $mountPath)) { return }
+
+  Write-Host "Unloading user hive..." -ForegroundColor DarkCyan
+  & reg.exe unload "HKU\$($HiveAccess.TempHiveName)" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "Warning: could not unload temporary hive HKU\$($HiveAccess.TempHiveName)." -ForegroundColor Yellow
+  }
+}
+
+function Ensure-TaskSchedulerHistoryEnabled {
+  Write-Host "Ensuring Task Scheduler history is enabled..." -ForegroundColor Cyan
+
+  $wevtutil = Join-Path $env:windir 'System32\wevtutil.exe'
+  if (-not (Test-Path $wevtutil)) { $wevtutil = 'wevtutil.exe' }
+
+  & $wevtutil set-log 'Microsoft-Windows-TaskScheduler/Operational' /enabled:true | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "Task Scheduler history enabled." -ForegroundColor Green
+  } else {
+    Write-Host "Warning: could not enable Task Scheduler history." -ForegroundColor Yellow
+  }
+}
+
+function Set-SystemTimeAndLocation {
+  param(
+    [Parameter(Mandatory)] [string]$TimeZoneId,
+    [Parameter(Mandatory)] [int]$GeoId
+  )
+
+  try {
+    Set-TimeZone -Id $TimeZoneId -ErrorAction Stop
+    Write-Host "Time zone set to '$TimeZoneId'." -ForegroundColor Green
+  } catch {
+    Write-Host "Warning: failed to set time zone '$TimeZoneId': $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+
+  if (Get-Command -Name Set-WinHomeLocation -ErrorAction SilentlyContinue) {
+    try {
+      Set-WinHomeLocation -GeoId $GeoId -ErrorAction Stop
+      Write-Host "Windows home location GeoID set to $GeoId." -ForegroundColor Green
+    } catch {
+      Write-Host "Warning: failed to set Windows home location GeoID ${GeoId}: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host "Set-WinHomeLocation cmdlet is unavailable; skipped home location update." -ForegroundColor Yellow
+  }
+}
+
+function Prompt-TimeAndLocationSetup {
+  $defaultTimeZone = 'Hawaiian Standard Time'
+  $defaultGeoId = 244 # United States
+
+  Write-Host "`nTime and location setup:" -ForegroundColor Cyan
+  Write-Host "Default is Hanalei, HI (Time Zone: $defaultTimeZone, GeoID: $defaultGeoId)." -ForegroundColor Cyan
+  $choice = Read-Host "Use this default? (Y/N, Enter = Y)"
+
+  if ([string]::IsNullOrWhiteSpace($choice) -or ($choice -match '^[Yy]')) {
+    Set-SystemTimeAndLocation -TimeZoneId $defaultTimeZone -GeoId $defaultGeoId
+    return
+  }
+
+  $tzInput = Read-Host "Enter Windows Time Zone ID (Enter = $defaultTimeZone)"
+  if ([string]::IsNullOrWhiteSpace($tzInput)) { $tzInput = $defaultTimeZone }
+
+  $geoInput = Read-Host "Enter Windows Home Location GeoID (Enter = $defaultGeoId)"
+  $geoId = $defaultGeoId
+  if (-not [string]::IsNullOrWhiteSpace($geoInput)) {
+    if ($geoInput -match '^\d+$') {
+      $geoId = [int]$geoInput
+    } else {
+      Write-Host "Invalid GeoID '$geoInput'; using default $defaultGeoId." -ForegroundColor Yellow
+    }
+  }
+
+  Set-SystemTimeAndLocation -TimeZoneId $tzInput -GeoId $geoId
+}
+
 function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
-  # $HiveRoot example: HKU:\TEMP_CHILD_HIVE
+  # $HiveRoot example: Registry::HKEY_USERS\<SID>
 
   Write-Host "Applying per-user lockdown policies to hive: $HiveRoot" -ForegroundColor Cyan
 
@@ -485,14 +738,12 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
 }
 
 function Ensure-SecureTaskScriptCopy([string]$SourcePath) {
-  $taskDir = Join-Path $env:ProgramData 'ChildLockdown'
-  Ensure-Directory $taskDir
+  $taskDir = Ensure-SecureChildLockdownRoot
 
   $destPath = Join-Path $taskDir 'ApplyChildLockdown.ps1'
   Copy-Item -Path $SourcePath -Destination $destPath -Force
 
   # Lock task script path to SYSTEM + local admins only.
-  & icacls.exe $taskDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /C | Out-Null
   & icacls.exe $destPath /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /C | Out-Null
 
   return $destPath
@@ -561,108 +812,124 @@ function Ensure-FirstLogonTask([string]$ChildUserName, [string]$ChildSid) {
 
 function Internal-ApplyUserLockdown([string]$Sid) {
   Assert-Admin
-  $hive = $null
+  $hiveAccess = $null
   try {
-    $hive = Load-UserHive $Sid
-    if (-not $hive) {
+    $hiveAccess = Resolve-UserHiveAccess $Sid
+    if (-not $hiveAccess) {
       Write-Host "User hive not available yet (profile not created)." -ForegroundColor Yellow
       return
     }
-    Apply-UserLockdownToHive -HiveRoot $hive -Sid $Sid
+    Apply-UserLockdownToHive -HiveRoot $hiveAccess.HiveRoot -Sid $Sid
   } finally {
-    Unload-UserHive
+    Close-UserHiveAccess -HiveAccess $hiveAccess
   }
 }
 
 # ---------------- MAIN ----------------
 Assert-Admin
-
-if ($InternalApplyUserLockdown) {
-  if (-not $InternalUserSid) { throw 'Missing -InternalUserSid' }
-  Internal-ApplyUserLockdown -Sid $InternalUserSid
-  return
-}
-
-if ($RemoveChromePolicies) {
-  Remove-ChromeHardening
-  return
-}
-
-if ($RemoveUserLockdown) {
-  if (-not $UserName) { $UserName = Read-Host 'Enter the child local username to unlock' }
-  $sid = Get-LocalUserSid $UserName
-  if (-not $sid) { throw "Could not find SID for user '$UserName'" }
-
-  $hive = $null
-  try {
-    $hive = Load-UserHive $sid
-    if (-not $hive) {
-      Write-Host "Cannot load hive now. Have the user sign in once to create the profile, then rerun." -ForegroundColor Yellow
-      return
-    }
-    Remove-UserLockdownFromHive -HiveRoot $hive -Sid $sid
-  } finally {
-    Unload-UserHive
-  }
-
-  Write-Host "If you created a scheduled task ApplyChildLockdown_$UserName, delete it from Task Scheduler." -ForegroundColor Yellow
-  return
-}
-
-# Interactive flow
-$childUser = Read-Host 'Enter LOCAL child account name to create (e.g., Student01)'
-if (-not $childUser) { throw 'Username cannot be empty.' }
-
-Ensure-ChromeInstalled
-Create-LocalStandardUser -Name $childUser
-
-# Chrome RestrictSigninToPattern
-Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
-Write-Host "Enter allowed child email(s). Separate multiple emails with commas." -ForegroundColor Cyan
-$emailsRaw = Read-Host 'Allowed email(s)'
-$emails = @()
-if ($emailsRaw) {
-  $emails = @($emailsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-}
-
-$pattern = $null
-if ($emails.Count -eq 1) {
-  # exact match
-  $escaped = [Regex]::Escape($emails[0])
-  $pattern = "^$escaped$"
-} elseif ($emails.Count -gt 1) {
-  $escaped = $emails | ForEach-Object { [Regex]::Escape($_) }
-  $pattern = "^($($escaped -join '|'))$"
-} else {
-  Write-Host "No email pattern provided; Chrome will still force sign-in but will not restrict to a specific account." -ForegroundColor Yellow
-}
-
-Apply-ChromeHardening -RestrictSigninPatternRegex $pattern
-
-# Per-user lockdown
-$sid = Get-LocalUserSid $childUser
-if (-not $sid) { throw "Could not resolve SID for '$childUser'" }
-
-Write-Host "`nApplying Windows per-user lockdown for '$childUser'..." -ForegroundColor Cyan
-$hive = $null
 try {
-  $hive = Load-UserHive $sid
-  if ($hive) {
-    Apply-UserLockdownToHive -HiveRoot $hive -Sid $sid
-  } else {
-    Write-Host "User profile hive not found yet. The child must sign in once to create the profile." -ForegroundColor Yellow
-    Write-Host "A logon task will be created so lockdown is applied automatically at first sign-in." -ForegroundColor Yellow
-    Ensure-FirstLogonTask -ChildUserName $childUser -ChildSid $sid
-  }
-} finally {
-  Unload-UserHive
-}
+  Start-SecureTranscriptLogging
 
-Write-Host "`nDONE." -ForegroundColor Green
-Write-Host "Next steps (manual):" -ForegroundColor Cyan
-Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
-Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
-Write-Host "3) (Optional) Clean desktop icons / hide Recycle Bin using Personalization as desired." -ForegroundColor Cyan
-Write-Host "`nRollback:" -ForegroundColor Yellow
-Write-Host "- Remove Chrome policies:   .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveChromePolicies" -ForegroundColor Yellow
-Write-Host "- Remove user lockdown:     .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveUserLockdown -UserName <name>" -ForegroundColor Yellow
+  if ($InternalApplyUserLockdown) {
+    if (-not $InternalUserSid) { throw 'Missing -InternalUserSid' }
+    Internal-ApplyUserLockdown -Sid $InternalUserSid
+    return
+  }
+
+  if ($RemoveChromePolicies) {
+    Remove-ChromeHardening
+    return
+  }
+
+  if ($RemoveUserLockdown) {
+    if (-not $UserName) { $UserName = Read-Host 'Enter the child local username to unlock' }
+    $sid = Get-LocalUserSid $UserName
+    if (-not $sid) { throw "Could not find SID for user '$UserName'" }
+
+    $hiveAccess = $null
+    try {
+      $hiveAccess = Resolve-UserHiveAccess $sid
+      if (-not $hiveAccess) {
+        Write-Host "Cannot load hive now. Have the user sign in once to create the profile, then rerun." -ForegroundColor Yellow
+        return
+      }
+      Remove-UserLockdownFromHive -HiveRoot $hiveAccess.HiveRoot -Sid $sid
+    } finally {
+      Close-UserHiveAccess -HiveAccess $hiveAccess
+    }
+
+    Write-Host "If you created a scheduled task ApplyChildLockdown_$UserName, delete it from Task Scheduler." -ForegroundColor Yellow
+    return
+  }
+
+  # Interactive flow
+  $selection = Prompt-ChildUserSelection
+  $childUser = $selection.UserName
+  if (-not $childUser) { throw 'Username cannot be empty.' }
+
+  Ensure-TaskSchedulerHistoryEnabled
+  Prompt-TimeAndLocationSetup
+
+  Ensure-ChromeInstalled
+  if ($selection.CreateNew) {
+    Create-LocalStandardUser -Name $childUser
+  } else {
+    if (Test-LocalUserIsAdmin -Name $childUser) {
+      throw "Selected user '$childUser' is an administrator. Choose a non-admin account."
+    }
+    Write-Host "Using existing non-admin local user '$childUser'." -ForegroundColor Green
+  }
+
+  # Chrome RestrictSigninToPattern
+  Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
+  Write-Host "Enter allowed child email(s). Separate multiple emails with commas." -ForegroundColor Cyan
+  $emailsRaw = Read-Host 'Allowed email(s)'
+  $emails = @()
+  if ($emailsRaw) {
+    $emails = @($emailsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  }
+
+  $pattern = $null
+  if ($emails.Count -eq 1) {
+    # exact match
+    $escaped = [Regex]::Escape($emails[0])
+    $pattern = "^$escaped$"
+  } elseif ($emails.Count -gt 1) {
+    $escaped = $emails | ForEach-Object { [Regex]::Escape($_) }
+    $pattern = "^($($escaped -join '|'))$"
+  } else {
+    Write-Host "No email pattern provided; Chrome will still force sign-in but will not restrict to a specific account." -ForegroundColor Yellow
+  }
+
+  Apply-ChromeHardening -RestrictSigninPatternRegex $pattern
+
+  # Per-user lockdown
+  $sid = Get-LocalUserSid $childUser
+  if (-not $sid) { throw "Could not resolve SID for '$childUser'" }
+
+  Write-Host "`nApplying Windows per-user lockdown for '$childUser'..." -ForegroundColor Cyan
+  $hiveAccess = $null
+  try {
+    $hiveAccess = Resolve-UserHiveAccess $sid
+    if ($hiveAccess) {
+      Apply-UserLockdownToHive -HiveRoot $hiveAccess.HiveRoot -Sid $sid
+    } else {
+      Write-Host "User profile hive not found yet. The child must sign in once to create the profile." -ForegroundColor Yellow
+      Write-Host "A logon task will be created so lockdown is applied automatically at first sign-in." -ForegroundColor Yellow
+      Ensure-FirstLogonTask -ChildUserName $childUser -ChildSid $sid
+    }
+  } finally {
+    Close-UserHiveAccess -HiveAccess $hiveAccess
+  }
+
+  Write-Host "`nDONE." -ForegroundColor Green
+  Write-Host "Next steps (manual):" -ForegroundColor Cyan
+  Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
+  Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
+  Write-Host "3) (Optional) Clean desktop icons / hide Recycle Bin using Personalization as desired." -ForegroundColor Cyan
+  Write-Host "`nRollback:" -ForegroundColor Yellow
+  Write-Host "- Remove Chrome policies:   .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveChromePolicies" -ForegroundColor Yellow
+  Write-Host "- Remove user lockdown:     .\Harden-Chrome-And-Lockdown-ChildUser_v2.ps1 -RemoveUserLockdown -UserName <name>" -ForegroundColor Yellow
+} finally {
+  Stop-SecureTranscriptLogging
+}
