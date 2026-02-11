@@ -12,13 +12,15 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Disable adding new profiles
    - Force browser sign-in
    - Restrict sign-in to allowed email(s)
+   - Force-install LearnWithAI extension for all Chrome profiles
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
 5) Applies shell cleanup for the child:
-   - Removes desktop shortcuts except approved apps (Chrome + StudyReel) from child/Public desktop
-   - Resets taskbar pin store to approved apps (Chrome + StudyReel, if installed) (best-effort)
+   - Removes desktop shortcuts except approved apps (Chrome + StudyReel + Alpha TimeBack) from child/Public desktop
+   - Removes unapproved taskbar pinned shortcuts (best-effort)
    - Sets Chrome to auto-start at child sign-in
+6) Creates a child-logon scheduled task to install Alpha TimeBack (Microsoft Store) into the child profile.
 
 SAFETY
 - Does NOT modify Administrator account.
@@ -361,6 +363,69 @@ function Ensure-ChromeInstalled {
   Install-ChromeSystemWide
 }
 
+function Ensure-AlphaTimeBackInstallTask([string]$ChildUserName) {
+  # Runs in child context at logon so Microsoft Store app install binds to that profile.
+  $taskName = "InstallAlphaTimeBack_$ChildUserName"
+  $psCommand = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$winget = (Get-Command -Name winget.exe -ErrorAction SilentlyContinue).Source
+$installSucceeded = $false
+if ($winget) {
+  $p = Start-Process -FilePath $winget -ArgumentList 'install','--id','9P4J5BWP49SM','--source','msstore','--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent' -NoNewWindow -Wait -PassThru
+  if ($p -and ($p.ExitCode -eq 0)) {
+    $installSucceeded = $true
+  }
+}
+if ($installSucceeded) {
+  schtasks.exe /Delete /TN '__TASK_NAME__' /F | Out-Null
+}
+'@
+  $psCommand = $psCommand.Replace('__TASK_NAME__', $taskName)
+  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
+  $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand"
+
+  if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
+    try {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+      $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $ChildUserName
+      $principal = New-ScheduledTaskPrincipal -UserId $ChildUserName -LogonType InteractiveToken -RunLevel Limited
+      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
+      Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
+      return
+    } catch {
+      Write-Host "Warning: failed to create Alpha TimeBack task with ScheduledTasks cmdlets: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+
+  $schtasksPath = "$env:windir\System32\schtasks.exe"
+  if (-not (Test-Path $schtasksPath)) { $schtasksPath = 'schtasks.exe' }
+  try {
+    Start-Process -FilePath $schtasksPath -ArgumentList '/Delete','/TN',$taskName,'/F' -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue | Out-Null
+    $trCmd = "powershell.exe $args"
+    $trArg = '"' + $trCmd + '"'
+    Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$ChildUserName,'/RL','LIMITED','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop | Out-Null
+    Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
+  } catch {
+    Write-Host "Warning: failed to create Alpha TimeBack install task via schtasks.exe." -ForegroundColor Yellow
+  }
+}
+
+function Remove-AlphaTimeBackInstallTask([string]$ChildUserName) {
+  $taskName = "InstallAlphaTimeBack_$ChildUserName"
+  try {
+    if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+    } else {
+      & schtasks.exe /Delete /TN $taskName /F | Out-Null
+    }
+  } catch {}
+}
+
 function Get-ChromeExecutablePath {
   $paths = @()
   $pf = $env:ProgramFiles
@@ -371,20 +436,6 @@ function Get-ChromeExecutablePath {
     if ($p -and (Test-Path $p)) { return $p }
   }
   return $null
-}
-
-function New-ExeShortcut([string]$ShortcutPath, [string]$ExePath) {
-  Ensure-Directory (Split-Path -Parent $ShortcutPath)
-  try {
-    $wsh = New-Object -ComObject WScript.Shell
-    $sc = $wsh.CreateShortcut($ShortcutPath)
-    $sc.TargetPath = $ExePath
-    $sc.WorkingDirectory = Split-Path -Parent $ExePath
-    $sc.IconLocation = "$ExePath,0"
-    $sc.Save()
-  } catch {
-    Write-Host "Warning: could not create shortcut ${ShortcutPath}: $($_.Exception.Message)" -ForegroundColor Yellow
-  }
 }
 
 function Get-StudyReelExecutablePath([string]$ProfilePath) {
@@ -409,10 +460,42 @@ function Get-StudyReelExecutablePath([string]$ProfilePath) {
   return $null
 }
 
-function Test-ShortcutLooksLikeApprovedApp([string]$ShortcutPath, [string]$ChromeExePath, [string]$StudyReelExePath) {
+function Get-AlphaTimeBackExecutableLeafNames {
+  $names = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($n in @('TimeBack.exe', 'AlphaTimeBack.exe', 'Alpha TimeBack.exe')) {
+    [void]$names.Add($n)
+  }
+
+  try {
+    $pkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+      $_.Name -match '(?i)(timeback|alpha)' -or $_.PackageFamilyName -match '(?i)(timeback|alpha)'
+    })
+    foreach ($pkg in $pkgs) {
+      if (-not $pkg.InstallLocation) { continue }
+      $manifestPath = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+      if (-not (Test-Path $manifestPath)) { continue }
+      try {
+        [xml]$manifest = Get-Content -Path $manifestPath -Raw -ErrorAction Stop
+        $apps = @($manifest.Package.Applications.Application)
+        foreach ($app in $apps) {
+          $exe = $app.Executable
+          if (-not $exe) { continue }
+          $leaf = [IO.Path]::GetFileName($exe)
+          if ($leaf -and ($leaf -like '*.exe')) {
+            [void]$names.Add($leaf)
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+
+  return @($names)
+}
+
+function Test-ShortcutLooksLikeApprovedApp([string]$ShortcutPath, [string]$ChromeExePath, [string]$StudyReelExePath, [string[]]$AlphaTimeBackExeLeafNames) {
   if (-not (Test-Path $ShortcutPath)) { return $false }
   $name = [IO.Path]::GetFileNameWithoutExtension($ShortcutPath)
-  if ($name -match '(?i)(chrome|study\s*reel|studyreel)') { return $true }
+  if ($name -match '(?i)(chrome|study\s*reel|studyreel|time\s*back|timeback|alpha\s*time\s*back)') { return $true }
 
   if ($ShortcutPath -like '*.lnk') {
     try {
@@ -424,47 +507,39 @@ function Test-ShortcutLooksLikeApprovedApp([string]$ShortcutPath, [string]$Chrom
 
       $leaf = [IO.Path]::GetFileName($sc.TargetPath)
       if ($leaf -match '^(?i)(chrome\.exe|studyreel\.exe)$') { return $true }
+      foreach ($alphaLeaf in @($AlphaTimeBackExeLeafNames)) {
+        if ($alphaLeaf -and ($leaf -ieq $alphaLeaf)) { return $true }
+      }
     } catch {}
   }
   return $false
 }
 
-function Remove-NonApprovedDesktopShortcuts([string]$DesktopPath, [string]$ChromeExePath, [string]$StudyReelExePath) {
+function Remove-NonApprovedDesktopShortcuts([string]$DesktopPath, [string]$ChromeExePath, [string]$StudyReelExePath, [string[]]$AlphaTimeBackExeLeafNames) {
   if (-not $DesktopPath -or -not (Test-Path $DesktopPath)) { return }
 
   $shortcutFiles = @(Get-ChildItem -Path $DesktopPath -File -ErrorAction SilentlyContinue | Where-Object {
     $_.Extension -in @('.lnk', '.url', '.appref-ms')
   })
   foreach ($f in $shortcutFiles) {
-    if (Test-ShortcutLooksLikeApprovedApp -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath -StudyReelExePath $StudyReelExePath) { continue }
+    if (Test-ShortcutLooksLikeApprovedApp -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath -StudyReelExePath $StudyReelExePath -AlphaTimeBackExeLeafNames $AlphaTimeBackExeLeafNames) { continue }
     Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
   }
 }
 
-function Reset-TaskbarPinsToApprovedApps([string]$ProfilePath, [string]$HiveRoot, [string]$ChromeExePath, [string]$StudyReelExePath) {
-  # Best-effort: clear pin stores and seed approved app shortcuts.
+function Remove-NonApprovedTaskbarPins([string]$ProfilePath, [string]$ChromeExePath, [string]$StudyReelExePath, [string[]]$AlphaTimeBackExeLeafNames) {
+  # Best-effort: remove unapproved taskbar pinned shortcuts without creating new ones.
   if (-not $ProfilePath -or -not (Test-Path $ProfilePath)) { return }
 
-  $pinnedRoot = Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned'
-  $taskbarPinned = Join-Path $pinnedRoot 'TaskBar'
+  $taskbarPinned = Join-Path $ProfilePath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+  if (-not (Test-Path $taskbarPinned)) { return }
 
-  if (Test-Path $pinnedRoot) {
-    Get-ChildItem -Path $pinnedRoot -Force -ErrorAction SilentlyContinue | ForEach-Object {
-      Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-    }
-  }
-  Ensure-Directory $taskbarPinned
-
-  $taskbarChromeShortcut = Join-Path $taskbarPinned 'Google Chrome.lnk'
-  New-ExeShortcut -ShortcutPath $taskbarChromeShortcut -ExePath $ChromeExePath
-  if ($StudyReelExePath -and (Test-Path $StudyReelExePath)) {
-    $taskbarStudyReelShortcut = Join-Path $taskbarPinned 'StudyReel.lnk'
-    New-ExeShortcut -ShortcutPath $taskbarStudyReelShortcut -ExePath $StudyReelExePath
-  }
-
-  $taskband = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
-  if (Test-Path $taskband) {
-    Remove-Item -Path $taskband -Recurse -Force -ErrorAction SilentlyContinue
+  $shortcutFiles = @(Get-ChildItem -Path $taskbarPinned -File -ErrorAction SilentlyContinue | Where-Object {
+    $_.Extension -in @('.lnk', '.url', '.appref-ms')
+  })
+  foreach ($f in $shortcutFiles) {
+    if (Test-ShortcutLooksLikeApprovedApp -ShortcutPath $f.FullName -ChromeExePath $ChromeExePath -StudyReelExePath $StudyReelExePath -AlphaTimeBackExeLeafNames $AlphaTimeBackExeLeafNames) { continue }
+    Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -491,16 +566,13 @@ function Apply-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
   $childDesktop = Join-Path $profilePath 'Desktop'
   $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
   $studyReelExe = Get-StudyReelExecutablePath -ProfilePath $profilePath
+  $alphaTimeBackExeLeafNames = Get-AlphaTimeBackExecutableLeafNames
 
-  # Remove public and per-user shortcuts except approved apps, then ensure Chrome shortcut exists.
-  Remove-NonApprovedDesktopShortcuts -DesktopPath $publicDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
-  Remove-NonApprovedDesktopShortcuts -DesktopPath $childDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
-  New-ExeShortcut -ShortcutPath (Join-Path $childDesktop 'Google Chrome.lnk') -ExePath $chromeExe
-  if ($studyReelExe -and (Test-Path $studyReelExe)) {
-    New-ExeShortcut -ShortcutPath (Join-Path $childDesktop 'StudyReel.lnk') -ExePath $studyReelExe
-  }
+  # Remove public and per-user shortcuts except approved apps.
+  Remove-NonApprovedDesktopShortcuts -DesktopPath $publicDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe -AlphaTimeBackExeLeafNames $alphaTimeBackExeLeafNames
+  Remove-NonApprovedDesktopShortcuts -DesktopPath $childDesktop -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe -AlphaTimeBackExeLeafNames $alphaTimeBackExeLeafNames
 
-  Reset-TaskbarPinsToApprovedApps -ProfilePath $profilePath -HiveRoot $HiveRoot -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe
+  Remove-NonApprovedTaskbarPins -ProfilePath $profilePath -ChromeExePath $chromeExe -StudyReelExePath $studyReelExe -AlphaTimeBackExeLeafNames $alphaTimeBackExeLeafNames
 }
 
 function Remove-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
@@ -556,6 +628,12 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   if (Test-Path $extBlock) { Remove-Item -Path $extBlock -Recurse -Force -ErrorAction SilentlyContinue }
   Ensure-RegistryKey $extBlock
   Set-RegistryValue -Path $extBlock -Name '1' -Value '*' -Type String
+
+  # Force-install LearnWithAI for all Chrome profiles.
+  $extForce = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
+  if (Test-Path $extForce) { Remove-Item -Path $extForce -Recurse -Force -ErrorAction SilentlyContinue }
+  Ensure-RegistryKey $extForce
+  Set-RegistryValue -Path $extForce -Name '1' -Value 'ejblanogjchhnpkbplblcmdpgfahhpdi;https://clients2.google.com/service/update2/crx' -Type String
 
   # Block high-risk internal pages.
   $urlBlock = 'HKLM:\SOFTWARE\Policies\Google\Chrome\URLBlocklist'
@@ -782,9 +860,14 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   Set-RegistryValue -Path $expl -Name 'RestrictRun' -Value 1 -Type DWord
 
   $rr = "$expl\RestrictRun"
+  if (Test-Path $rr) { Remove-Item -Path $rr -Recurse -Force -ErrorAction SilentlyContinue }
   Ensure-RegistryKey $rr
-  Set-RegistryValue -Path $rr -Name '1' -Value 'chrome.exe'   -Type String
-  Set-RegistryValue -Path $rr -Name '2' -Value 'StudyReel.exe' -Type String
+  $allowedApps = @('chrome.exe', 'StudyReel.exe')
+  $allowedApps += Get-AlphaTimeBackExecutableLeafNames
+  $allowedApps = @($allowedApps | Where-Object { $_ } | Select-Object -Unique)
+  for ($i = 0; $i -lt $allowedApps.Count; $i++) {
+    Set-RegistryValue -Path $rr -Name ($i + 1).ToString() -Value $allowedApps[$i] -Type String
+  }
 
   # Reduce common shell escape vectors.
   Set-RegistryValue -Path $expl -Name 'NoRun'     -Value 1 -Type DWord
@@ -818,7 +901,7 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   # Remove pinned programs list
   Set-RegistryValue -Path $expl -Name 'NoStartMenuPinnedList'  -Value 1 -Type DWord
   # Do not allow pinning changes on taskbar.
-  Set-RegistryValue -Path $expl -Name 'NoPinningToTaskbar'     -Value 1 -Type DWord
+  # Set-RegistryValue -Path $expl -Name 'NoPinningToTaskbar'     -Value 1 -Type DWord
 
   # --- Disable Store ---
   $store = "$HiveRoot\Software\Policies\Microsoft\WindowsStore"
@@ -1023,6 +1106,7 @@ try {
       Close-UserHiveAccess -HiveAccess $hiveAccess
     }
 
+    Remove-AlphaTimeBackInstallTask -ChildUserName $UserName
     Write-Host "If you created a scheduled task ApplyChildLockdown_$UserName, delete it from Task Scheduler." -ForegroundColor Yellow
     return
   }
@@ -1044,6 +1128,7 @@ try {
     }
     Write-Host "Using existing non-admin local user '$childUser'." -ForegroundColor Green
   }
+  Ensure-AlphaTimeBackInstallTask -ChildUserName $childUser
 
   # Chrome RestrictSigninToPattern
   Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
