@@ -685,8 +685,7 @@ function Apply-ChildExecutionDenyAcls([string]$Sid) {
     (Join-Path $profilePath 'Documents'),
     (Join-Path $profilePath 'Pictures'),
     (Join-Path $profilePath 'Music'),
-    (Join-Path $profilePath 'Videos'),
-    (Join-Path $profilePath 'AppData\Local\Temp')
+    (Join-Path $profilePath 'Videos')
   )
 
   foreach ($p in $targets) {
