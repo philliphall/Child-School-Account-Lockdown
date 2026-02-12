@@ -6,6 +6,7 @@ Creates a local standard (non-Microsoft) user, ensures system-wide Google Chrome
 GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-Lockdown.git!!!
 1) Prompts for a local child account name and creates a STANDARD local user.
 2) Ensures Google Chrome is installed system-wide. If missing, downloads the official Enterprise MSI and installs silently.
+2a) Optionally removes selected built-in distraction apps (best-effort, appx/provisioned).
 3) Applies Chrome machine policies (HKLM) to:
    - Disable Guest Mode
    - Disable Incognito
@@ -16,6 +17,7 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
+4a) Applies machine policy to disable Widgets/Feeds and creates a child logon task for taskbar UI toggles.
 5) Applies shell cleanup for the child:
    - Removes desktop shortcuts except approved apps (Chrome + StudyReel + Alpha TimeBack) from child/Public desktop
    - Removes unapproved taskbar pinned shortcuts (best-effort)
@@ -363,6 +365,101 @@ function Ensure-ChromeInstalled {
   Install-ChromeSystemWide
 }
 
+function Ensure-WidgetsDisabledMachinePolicy {
+  Write-Host "Applying machine-level Widgets/Feeds disable policy..." -ForegroundColor Cyan
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0 -Type DWord
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds' -Name 'EnableFeeds' -Value 0 -Type DWord
+}
+
+function Remove-AppxPackagesByPatterns {
+  param(
+    [Parameter(Mandatory)] [string[]]$Patterns
+  )
+
+  $pkgs = @(
+    Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+      $name = $_.Name
+      $family = $_.PackageFamilyName
+      foreach ($pat in $Patterns) {
+        if (($name -like $pat) -or ($family -like $pat)) { return $true }
+      }
+      return $false
+    }
+  )
+
+  foreach ($pkg in $pkgs) {
+    try {
+      Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+      Write-Host "Removed installed app package: $($pkg.Name)" -ForegroundColor Green
+    } catch {
+      try {
+        # Fallback for older builds/cmdlets where -AllUsers behavior differs.
+        Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop | Out-Null
+        Write-Host "Removed app package (fallback): $($pkg.Name)" -ForegroundColor Green
+      } catch {
+        Write-Host "Warning: could not remove app package '$($pkg.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+      }
+    }
+  }
+}
+
+function Remove-ProvisionedPackagesByPatterns {
+  param(
+    [Parameter(Mandatory)] [string[]]$Patterns
+  )
+
+  $provPkgs = @(
+    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
+      $display = $_.DisplayName
+      foreach ($pat in $Patterns) {
+        if ($display -like $pat) { return $true }
+      }
+      return $false
+    }
+  )
+
+  foreach ($prov in $provPkgs) {
+    try {
+      Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null
+      Write-Host "Removed provisioned package: $($prov.DisplayName)" -ForegroundColor Green
+    } catch {
+      Write-Host "Warning: could not remove provisioned package '$($prov.DisplayName)': $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+}
+
+function Remove-UnnecessaryBuiltInApps {
+  Write-Host "`nBuilt-in app cleanup:" -ForegroundColor Cyan
+  $choice = Read-Host "Remove unnecessary built-in apps now? (Y/N, Enter = Y)"
+  if ($choice -match '^[Nn]') {
+    Write-Host "Skipping built-in app cleanup at operator request." -ForegroundColor Yellow
+    return
+  }
+
+  # Best-effort patterns for common appx/provisioned names across Windows 10/11 variants.
+  $patterns = @(
+    '*Outlook*',
+    '*MicrosoftSolitaireCollection*',
+    '*Paint*',
+    '*Xbox*',
+    '*GamingApp*',
+    '*LinkedIn*',
+    '*WindowsCamera*',
+    '*Copilot*',
+    '*WindowsFeedbackHub*',
+    '*Bing*',
+    '*Clipchamp*',
+    '*Teams*',
+    '*News*'
+  )
+
+  Write-Host "Removing installed appx packages (all users)..." -ForegroundColor DarkCyan
+  Remove-AppxPackagesByPatterns -Patterns $patterns
+
+  Write-Host "Removing provisioned appx packages (new profiles)..." -ForegroundColor DarkCyan
+  Remove-ProvisionedPackagesByPatterns -Patterns $patterns
+}
+
 function Ensure-AlphaTimeBackInstallTask([string]$ChildUserName) {
   # Runs in child context at logon so Microsoft Store app install binds to that profile.
   $taskName = "InstallAlphaTimeBack_$ChildUserName"
@@ -401,6 +498,66 @@ function Ensure-AlphaTimeBackInstallTask([string]$ChildUserName) {
   } catch {
     Write-Host "Warning: failed to create Alpha TimeBack install task via schtasks.exe: $($_.Exception.Message)" -ForegroundColor Yellow
   }
+}
+
+function Ensure-ChildTaskbarUiLockTask([string]$ChildUserName) {
+  # Runs in child context at each sign-in to enforce taskbar distraction toggles where offline hive ACLs can block writes.
+  $taskName = "ApplyChildTaskbarUi_$ChildUserName"
+  $userId = "$env:COMPUTERNAME\$ChildUserName"
+  $cmd = @(
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarDa /t REG_DWORD /d 0 /f',
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarMn /t REG_DWORD /d 0 /f',
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ShowTaskViewButton /t REG_DWORD /d 0 /f',
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f',
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v IsDynamicSearchBoxEnabled /t REG_DWORD /d 0 /f',
+    'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Feeds" /v ShellFeedsTaskbarViewMode /t REG_DWORD /d 2 /f'
+  ) -join ' & '
+  $cmdArgs = "/c $cmd"
+
+  if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
+    try {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+      $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmdArgs
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+      $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
+      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
+      Write-Host "Created child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
+      return
+    } catch {
+      Write-Host "Warning: failed to create child UI task with ScheduledTasks cmdlets: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+
+  $schtasksPath = "$env:windir\System32\schtasks.exe"
+  if (-not (Test-Path $schtasksPath)) { $schtasksPath = 'schtasks.exe' }
+  try {
+    Start-Process -FilePath $schtasksPath -ArgumentList '/Delete','/TN',$taskName,'/F' -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue | Out-Null
+    $trCmd = "cmd.exe $cmdArgs"
+    $trArg = '"' + $trCmd + '"'
+    $p = Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$userId,'/RL','LIMITED','/IT','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    if ($p.ExitCode -eq 0) {
+      Write-Host "Created child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
+    } else {
+      Write-Host "Warning: schtasks returned exit code $($p.ExitCode) while creating '$taskName'." -ForegroundColor Yellow
+    }
+  } catch {
+    Write-Host "Warning: failed to create child UI task via schtasks.exe: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Remove-ChildTaskbarUiLockTask([string]$ChildUserName) {
+  $taskName = "ApplyChildTaskbarUi_$ChildUserName"
+  try {
+    if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+    } else {
+      & schtasks.exe /Delete /TN $taskName /F | Out-Null
+    }
+  } catch {}
 }
 
 function Remove-AlphaTimeBackInstallTask([string]$ChildUserName) {
@@ -889,6 +1046,8 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   Set-RegistryValue -Path $expl -Name 'NoFind'                 -Value 1 -Type DWord
   # Remove pinned programs list
   Set-RegistryValue -Path $expl -Name 'NoStartMenuPinnedList'  -Value 1 -Type DWord
+  # Remove notification center to reduce distractions.
+  Set-RegistryValue -Path $expl -Name 'DisableNotificationCenter' -Value 1 -Type DWord
   # Do not allow pinning changes on taskbar.
   # Set-RegistryValue -Path $expl -Name 'NoPinningToTaskbar'     -Value 1 -Type DWord
 
@@ -916,6 +1075,19 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   $winExplorerPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Explorer"
   Ensure-RegistryKey $winExplorerPol
   Set-RegistryValue -Path $winExplorerPol -Name 'DisableSearchBoxSuggestions' -Value 1 -Type DWord
+  # Hide Task View to reduce virtual desktop creation/switching surfaces.
+  Set-RegistryValue -Path $winExplorerPol -Name 'HideTaskViewButton' -Value 1 -Type DWord
+  
+  # Clear pinned Start apps.
+  Set-RegistryValue -Path $winExplorerPol -Name 'ConfigureStartPins' -Value '{"pinnedList":[]}' -Type String
+
+  # Disable widgets/feeds surfaces (best-effort across Windows builds).
+  $dshPol = "$HiveRoot\Software\Policies\Microsoft\Dsh"
+  Set-RegistryValue -Path $dshPol -Name 'AllowNewsAndInterests' -Value 0 -Type DWord
+  $feedsPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Windows Feeds"
+  Set-RegistryValue -Path $feedsPol -Name 'EnableFeeds' -Value 0 -Type DWord
+
+  # Per-user taskbar UI values are enforced by the child logon task (ApplyChildTaskbarUi_*).
 
   # "Don't run specified Windows applications" list for common bypass binaries.
   Set-RegistryValue -Path $expl -Name 'DisallowRun' -Value 1 -Type DWord
@@ -935,6 +1107,7 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
     'rundll32.exe',
     'msiexec.exe',
     'taskmgr.exe',
+    'TaskView.exe',
     'notepad.exe',
     'msedge.exe',
     'iexplore.exe'
@@ -960,10 +1133,29 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
   $desktopPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Control Panel\Desktop"
   $store = "$HiveRoot\Software\Policies\Microsoft\WindowsStore"
   $winExplorerPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Explorer"
+  $dshPol = "$HiveRoot\Software\Policies\Microsoft\Dsh"
+  $feedsPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Windows Feeds"
+  $explorerAdvanced = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+  $search = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Search"
+  $feeds = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Feeds"
 
   # Remove the keys we created (best-effort)
-  foreach ($k in @($expl, "$expl\RestrictRun", $sysPol, $sys, $desktopPol, $store, $winExplorerPol)) {
+  foreach ($k in @($expl, "$expl\RestrictRun", $sysPol, $sys, $desktopPol, $store, $winExplorerPol, $dshPol, $feedsPol)) {
     if (Test-Path $k) { Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+
+  # Clean up non-policy values written under regular per-user locations.
+  foreach ($pair in @(
+    @{ Path = $explorerAdvanced; Name = 'TaskbarDa' },
+    @{ Path = $explorerAdvanced; Name = 'TaskbarMn' },
+    @{ Path = $explorerAdvanced; Name = 'ShowTaskViewButton' },
+    @{ Path = $search; Name = 'SearchboxTaskbarMode' },
+    @{ Path = $search; Name = 'IsDynamicSearchBoxEnabled' },
+    @{ Path = $feeds; Name = 'ShellFeedsTaskbarViewMode' }
+  )) {
+    if (Test-Path $pair.Path) {
+      Remove-ItemProperty -Path $pair.Path -Name $pair.Name -Force -ErrorAction SilentlyContinue
+    }
   }
 
   if ($Sid) {
@@ -1095,6 +1287,7 @@ try {
       Close-UserHiveAccess -HiveAccess $hiveAccess
     }
 
+    Remove-ChildTaskbarUiLockTask -ChildUserName $UserName
     Remove-AlphaTimeBackInstallTask -ChildUserName $UserName
     Write-Host "If you created a scheduled task ApplyChildLockdown_$UserName, delete it from Task Scheduler." -ForegroundColor Yellow
     return
@@ -1108,6 +1301,8 @@ try {
   Ensure-TaskSchedulerHistoryEnabled
   Prompt-TimeAndLocationSetup
 
+  Ensure-WidgetsDisabledMachinePolicy
+  Remove-UnnecessaryBuiltInApps
   Ensure-ChromeInstalled
   if ($selection.CreateNew) {
     Create-LocalStandardUser -Name $childUser
@@ -1117,6 +1312,7 @@ try {
     }
     Write-Host "Using existing non-admin local user '$childUser'." -ForegroundColor Green
   }
+  Ensure-ChildTaskbarUiLockTask -ChildUserName $childUser
   Ensure-AlphaTimeBackInstallTask -ChildUserName $childUser
 
   # Chrome RestrictSigninToPattern
