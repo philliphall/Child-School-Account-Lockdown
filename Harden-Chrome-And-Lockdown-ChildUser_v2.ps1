@@ -366,32 +366,18 @@ function Ensure-ChromeInstalled {
 function Ensure-AlphaTimeBackInstallTask([string]$ChildUserName) {
   # Runs in child context at logon so Microsoft Store app install binds to that profile.
   $taskName = "InstallAlphaTimeBack_$ChildUserName"
-  $psCommand = @'
-$ErrorActionPreference = 'SilentlyContinue'
-$winget = (Get-Command -Name winget.exe -ErrorAction SilentlyContinue).Source
-$installSucceeded = $false
-if ($winget) {
-  $p = Start-Process -FilePath $winget -ArgumentList 'install','--id','9P4J5BWP49SM','--source','msstore','--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent' -NoNewWindow -Wait -PassThru
-  if ($p -and ($p.ExitCode -eq 0)) {
-    $installSucceeded = $true
-  }
-}
-if ($installSucceeded) {
-  schtasks.exe /Delete /TN '__TASK_NAME__' /F | Out-Null
-}
-'@
-  $psCommand = $psCommand.Replace('__TASK_NAME__', $taskName)
-  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
-  $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand"
+  $userId = "$env:COMPUTERNAME\$ChildUserName"
+  $installCmd = "winget install 9P4J5BWP49SM --source msstore --silent --accept-source-agreements --accept-package-agreements --disable-interactivity && schtasks /Delete /TN ""$taskName"" /F"
+  $cmdArgs = "/c $installCmd"
 
   if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
     try {
       if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
       }
-      $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
-      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $ChildUserName
-      $principal = New-ScheduledTaskPrincipal -UserId $ChildUserName -LogonType InteractiveToken -RunLevel Limited
+      $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmdArgs
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+      $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
       Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
       Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
       return
@@ -404,12 +390,16 @@ if ($installSucceeded) {
   if (-not (Test-Path $schtasksPath)) { $schtasksPath = 'schtasks.exe' }
   try {
     Start-Process -FilePath $schtasksPath -ArgumentList '/Delete','/TN',$taskName,'/F' -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue | Out-Null
-    $trCmd = "powershell.exe $args"
+    $trCmd = "cmd.exe $cmdArgs"
     $trArg = '"' + $trCmd + '"'
-    Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$ChildUserName,'/RL','LIMITED','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop | Out-Null
-    Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
+    $p = Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$userId,'/RL','LIMITED','/IT','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    if ($p.ExitCode -eq 0) {
+      Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
+    } else {
+      Write-Host "Warning: schtasks returned exit code $($p.ExitCode) while creating '$taskName'." -ForegroundColor Yellow
+    }
   } catch {
-    Write-Host "Warning: failed to create Alpha TimeBack install task via schtasks.exe." -ForegroundColor Yellow
+    Write-Host "Warning: failed to create Alpha TimeBack install task via schtasks.exe: $($_.Exception.Message)" -ForegroundColor Yellow
   }
 }
 
