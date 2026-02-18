@@ -13,7 +13,7 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Disable adding new profiles
    - Force browser sign-in
    - Restrict sign-in to allowed email(s)
-   - Force-install LearnWithAI extension for all Chrome profiles
+   - Allow approved extensions for profiles install
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
@@ -145,33 +145,63 @@ function Get-LocalUserSid([string]$Name) {
   }
 }
 
+function Read-ConfirmedSecurePassword([string]$Prompt1 = 'Enter password', [string]$Prompt2 = 'Confirm password') {
+  $pw1 = Read-Host $Prompt1 -AsSecureString
+  $pw2 = Read-Host $Prompt2 -AsSecureString
+
+  # compare secure strings by converting to plain text briefly (in-memory)
+  $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw1)
+  $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw2)
+  try {
+    $s1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
+    $s2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
+    if ($s1 -ne $s2) { throw 'Passwords do not match.' }
+  } finally {
+    if ($b1 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1) }
+    if ($b2 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2) }
+  }
+
+  return $pw1
+}
+
+function Ensure-ChildUserPasswordSettings([string]$Name, [switch]$PromptForPasswordUpdate) {
+  if ($PromptForPasswordUpdate) {
+    $pwChoice = Read-Host "Set or update password for '$Name' now? (Y/N, Enter = Y)"
+    if (-not ($pwChoice -match '^[Nn]')) {
+      $pw = Read-ConfirmedSecurePassword -Prompt1 'Enter password' -Prompt2 'Confirm password'
+      Set-LocalUser -Name $Name -Password $pw -ErrorAction Stop
+      Write-Host "Password updated for '$Name'." -ForegroundColor Green
+    } else {
+      Write-Host "Skipping password update for '$Name' at operator request." -ForegroundColor Yellow
+    }
+  }
+
+  # Prevent forced reset prompts/expiry for this local child account.
+  try { Set-LocalUser -Name $Name -PasswordNeverExpires $true -ErrorAction SilentlyContinue } catch {}
+  try { & net.exe accounts /maxpwage:unlimited | Out-Null } catch {}
+  try { & net.exe user $Name /logonpasswordchg:no | Out-Null } catch {}
+  try { & net.exe user $Name /passwordchg:no | Out-Null } catch {}
+}
+
 function Create-LocalStandardUser([string]$Name) {
+  $result = [PSCustomObject]@{
+    Created            = $false
+    PasswordConfigured = $false
+  }
+
   $existing = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
   if ($existing) {
     Write-Host "Local user '$Name' already exists. Skipping creation." -ForegroundColor Yellow
-    return
+    return $result
   }
 
   Write-Host "Creating local STANDARD user: $Name" -ForegroundColor Cyan
 
   $pwChoice = Read-Host "Set a password now? (Y/N)"
   if ($pwChoice -match '^[Yy]') {
-    $pw1 = Read-Host "Enter password" -AsSecureString
-    $pw2 = Read-Host "Confirm password" -AsSecureString
-	
-    # compare secure strings by converting to plain text briefly (in-memory)
-    $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw1)
-    $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw2)
-    try {
-      $s1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
-      $s2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
-      if ($s1 -ne $s2) { throw 'Passwords do not match.' }
-    } finally {
-      if ($b1 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1) }
-      if ($b2 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2) }
-    }
-
-    New-LocalUser -Name $Name -Password $pw1 -AccountNeverExpires:$true -PasswordNeverExpires:$true -UserMayNotChangePassword:$true | Out-Null
+    $pw = Read-ConfirmedSecurePassword -Prompt1 'Enter password' -Prompt2 'Confirm password'
+    New-LocalUser -Name $Name -Password $pw -AccountNeverExpires:$true -PasswordNeverExpires:$true -UserMayNotChangePassword:$true | Out-Null
+    $result.PasswordConfigured = $true
   } else {
     # Create without password only if local policy allows. If blocked, user will see a clear error.
     New-LocalUser -Name $Name -NoPassword -AccountNeverExpires:$true | Out-Null
@@ -182,6 +212,8 @@ function Create-LocalStandardUser([string]$Name) {
   try { Add-LocalGroupMember -Group 'Users' -Member $Name -ErrorAction SilentlyContinue } catch {}
 
   Write-Host "User '$Name' created as a standard local user." -ForegroundColor Green
+  $result.Created = $true
+  return $result
 }
 
 function Get-LocalAdministratorsMemberSids {
@@ -753,8 +785,6 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   Set-RegistryValue -Path $base -Name 'BrowserGuestModeEnabled'    -Value 0 -Type DWord
   # Disable Incognito (1 = disabled)
   Set-RegistryValue -Path $base -Name 'IncognitoModeAvailability'  -Value 1 -Type DWord
-  # Disable adding profiles
-  Set-RegistryValue -Path $base -Name 'BrowserAddPersonEnabled'    -Value 0 -Type DWord
   # Force browser sign-in
   Set-RegistryValue -Path $base -Name 'ForceBrowserSignin'         -Value 1 -Type DWord
   # Browser sign-in mode (2 = force sign-in)
@@ -764,6 +794,14 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   Set-RegistryValue -Path $base -Name 'AutofillAddressEnabled'     -Value 0 -Type DWord
   Set-RegistryValue -Path $base -Name 'AutofillCreditCardEnabled'  -Value 0 -Type DWord
   Set-RegistryValue -Path $base -Name 'BlockExternalExtensions'    -Value 1 -Type DWord
+  Set-RegistryValue -Path $base -Name 'BlockSensitiveInternalPages' -Value 1 -Type DWord
+
+  # Exceptions to blocking of Sensitive Internal Pages (and other URLs)
+  $exceptSensitive = 'HKLM:\SOFTWARE\Policies\Google\Chrome\URLAllowList'
+  if (Test-Path $exceptSensitive) { Remove-Item -Path $exceptSensitive -Recurse -Force -ErrorAction SilentlyContinue }
+  Ensure-RegistryKey $exceptSensitive
+  Set-RegistryValue -Path $exceptSensitive -Name '1' -Value '*' -Type String
+
 
   if ($RestrictSigninPatternRegex) {
     # Restrict to allowed account(s) using regex
@@ -776,27 +814,28 @@ function Apply-ChromeHardening([string]$RestrictSigninPatternRegex) {
   Ensure-RegistryKey $extBlock
   Set-RegistryValue -Path $extBlock -Name '1' -Value '*' -Type String
 
-  # Force-install LearnWithAI for all Chrome profiles.
+  # Allow specific extensions to be installed by user/profile policy despite blocklist '*'.
+  $extAllow = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallAllowlist'
+  if (Test-Path $extAllow) { Remove-Item -Path $extAllow -Recurse -Force -ErrorAction SilentlyContinue }
+  # Ensure-RegistryKey $extAllow
+  # Set-RegistryValue -Path $extAllow -Name '1' -Value 'ejblanogjchhnpkbplblcmdpgfahhpdi' -Type String # LearnWithAI
+  # Set-RegistryValue -Path $extAllow -Name '2' -Value 'oelebjkghohmgbpkdpcblodalbhinkjj' -Type String # StudyReel
+  # Set-RegistryValue -Path $extAllow -Name '3' -Value 'pkghkdhemgjcleedplodmflgdlhjefmp' -Type String # Alpha Data Collection
+
+  # Ensure no forced extension install remains from older script versions.
   $extForce = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
   if (Test-Path $extForce) { Remove-Item -Path $extForce -Recurse -Force -ErrorAction SilentlyContinue }
-  Ensure-RegistryKey $extForce
-  Set-RegistryValue -Path $extForce -Name '1' -Value 'ejblanogjchhnpkbplblcmdpgfahhpdi;https://clients2.google.com/service/update2/crx' -Type String
 
-  # Block high-risk internal pages.
-  $urlBlock = 'HKLM:\SOFTWARE\Policies\Google\Chrome\URLBlocklist'
-  if (Test-Path $urlBlock) { Remove-Item -Path $urlBlock -Recurse -Force -ErrorAction SilentlyContinue }
-  Ensure-RegistryKey $urlBlock
-  $blockedUrls = @(
-    'chrome://settings*',
-    'chrome://extensions*',
-    'chrome://flags*',
-    'chrome://policy*',
-    'chrome://version*',
-    'chrome://inspect*'
-  )
-  for ($i = 0; $i -lt $blockedUrls.Count; $i++) {
-    Set-RegistryValue -Path $urlBlock -Name ($i + 1).ToString() -Value $blockedUrls[$i] -Type String
-  }
+  # Block pages.
+  # $urlBlock = 'HKLM:\SOFTWARE\Policies\Google\Chrome\URLBlocklist'
+  # if (Test-Path $urlBlock) { Remove-Item -Path $urlBlock -Recurse -Force -ErrorAction SilentlyContinue }
+  # Ensure-RegistryKey $urlBlock
+  # $blockedUrls = @(
+  #   'example.com'
+  # )
+  # for ($i = 0; $i -lt $blockedUrls.Count; $i++) {
+  #   Set-RegistryValue -Path $urlBlock -Name ($i + 1).ToString() -Value $blockedUrls[$i] -Type String
+  # }
 
   Write-Host "Chrome policies written. In Chrome: open chrome://policy and click 'Reload policies'." -ForegroundColor Green
 }
@@ -1031,7 +1070,7 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   # --- Enforce lock screen on idle + password on resume ---
   $desktopPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Control Panel\Desktop"
   Set-RegistryValue -Path $desktopPol -Name 'ScreenSaveActive'    -Value '1'   -Type String
-  Set-RegistryValue -Path $desktopPol -Name 'ScreenSaverIsSecure' -Value '1'   -Type String
+  Set-RegistryValue -Path $desktopPol -Name 'ScreenSaverIsSecure' -Value '0'   -Type String
   Set-RegistryValue -Path $desktopPol -Name 'ScreenSaveTimeOut'   -Value '300' -Type String
   Set-RegistryValue -Path $desktopPol -Name 'SCRNSAVE.EXE'        -Value (Join-Path $env:WINDIR 'System32\scrnsave.scr') -Type String
 
@@ -1304,20 +1343,28 @@ try {
   Ensure-WidgetsDisabledMachinePolicy
   Remove-UnnecessaryBuiltInApps
   Ensure-ChromeInstalled
+  $creationResult = $null
   if ($selection.CreateNew) {
-    Create-LocalStandardUser -Name $childUser
+    $creationResult = Create-LocalStandardUser -Name $childUser
   } else {
     if (Test-LocalUserIsAdmin -Name $childUser) {
       throw "Selected user '$childUser' is an administrator. Choose a non-admin account."
     }
     Write-Host "Using existing non-admin local user '$childUser'." -ForegroundColor Green
   }
+
+  $promptForPasswordUpdate = $true
+  if ($selection.CreateNew -and $creationResult -and $creationResult.PasswordConfigured) {
+    $promptForPasswordUpdate = $false
+  }
+  Ensure-ChildUserPasswordSettings -Name $childUser -PromptForPasswordUpdate:$promptForPasswordUpdate
+
   Ensure-ChildTaskbarUiLockTask -ChildUserName $childUser
   Ensure-AlphaTimeBackInstallTask -ChildUserName $childUser
 
   # Chrome RestrictSigninToPattern
   Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
-  Write-Host "Enter allowed child email(s). Separate multiple emails with commas." -ForegroundColor Cyan
+  Write-Host "Enter allowed child email(s). Separate multiple emails with commas. Leave blank to allow all." -ForegroundColor Cyan
   $emailsRaw = Read-Host 'Allowed email(s)'
   $emails = @()
   if ($emailsRaw) {
