@@ -16,14 +16,15 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Allow approved extensions for profiles install
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
-   If the child has never signed in (no profile hive yet), creates a SYSTEM scheduled task to apply lockdown at first logon.
-4a) Applies machine policy to disable Widgets/Feeds and creates a child logon task for taskbar UI toggles.
+   If the child has never signed in (no profile hive yet), the script exits and instructs a sign-in/sign-out,
+   then rerun, so policies are applied directly to the user hive.
+4a) Applies machine policy to disable Widgets/Feeds, disable location, suppress OneDrive backup/sign-in prompts,
+    and creates a child logon task for taskbar UI toggles.
 5) Applies shell cleanup for the child:
    - Removes desktop shortcuts except approved apps (Chrome + StudyReel + Alpha TimeBack) from child/Public desktop
    - Removes unapproved taskbar pinned shortcuts (best-effort)
    - Sets Chrome to auto-start at child sign-in
-6) Creates a child-logon scheduled task to install Alpha TimeBack (Microsoft Store) into the child profile.
-7) Copies StudyReel-Installer.exe (if present next to this script) into a secure installer path and creates a
+6) Copies StudyReel-Installer.exe (if present next to this script) into a secure installer path and creates a
    child-logon scheduled task (runs as the child user) to install it into that profile.
 
 SAFETY
@@ -160,6 +161,27 @@ function Set-RegistryValue {
     'QWord'        { 'QWord' }
   }
   New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $t -Force | Out-Null
+}
+
+function Ensure-CurrentUserExecutionPolicyBypass {
+  try {
+    $current = Get-ExecutionPolicy -Scope CurrentUser -ErrorAction Stop
+  } catch {
+    Write-Host "Warning: could not read CurrentUser execution policy: $($_.Exception.Message)" -ForegroundColor Yellow
+    return
+  }
+
+  if ($current -eq 'Bypass') {
+    Write-Host "ExecutionPolicy (CurrentUser) already set to Bypass." -ForegroundColor Green
+    return
+  }
+
+  try {
+    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force -ErrorAction Stop
+    Write-Host "Set ExecutionPolicy (CurrentUser) to Bypass." -ForegroundColor Green
+  } catch {
+    Write-Host "Warning: failed to set ExecutionPolicy (CurrentUser) to Bypass: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
 }
 
 function Get-LocalUserSid([string]$Name) {
@@ -444,9 +466,18 @@ function Ensure-ChromeInstalled {
 }
 
 function Ensure-WidgetsDisabledMachinePolicy {
-  Write-Host "Applying machine-level Widgets/Feeds disable policy..." -ForegroundColor Cyan
+  Write-Host "Applying machine-level Widgets/Feeds, Location, and OneDrive prompt suppression policies..." -ForegroundColor Cyan
   Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0 -Type DWord
   Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds' -Name 'EnableFeeds' -Value 0 -Type DWord
+
+  # Disable Windows location feature at machine scope (Computer Configuration > Location and Sensors > Turn off location).
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' -Name 'DisableLocation' -Value 1 -Type DWord
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' -Name 'DisableLocationScripting' -Value 1 -Type DWord
+
+  # Reduce OneDrive/backup enrollment prompts.
+  # Source: IT Admins - Use OneDrive policies to control sync settings (Microsoft Learn).
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -Name 'KFMBlockOptIn' -Value 1 -Type DWord
+  Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -Name 'DisableNewAccountDetection' -Value 1 -Type DWord
 }
 
 function Remove-AppxPackagesByPatterns {
@@ -538,46 +569,6 @@ function Remove-UnnecessaryBuiltInApps {
   Remove-ProvisionedPackagesByPatterns -Patterns $patterns
 }
 
-function Ensure-AlphaTimeBackInstallTask([string]$ChildUserName) {
-  # Runs in child context at logon so Microsoft Store app install binds to that profile.
-  $taskName = "InstallAlphaTimeBack_$ChildUserName"
-  $userId = "$env:COMPUTERNAME\$ChildUserName"
-  $installCmd = "winget install 9P4J5BWP49SM --source msstore --silent --accept-source-agreements --accept-package-agreements --disable-interactivity && schtasks /Delete /TN ""$taskName"" /F"
-  $cmdArgs = "/c $installCmd"
-
-  if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
-    try {
-      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-      }
-      $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmdArgs
-      $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
-      $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
-      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
-      Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
-      return
-    } catch {
-      Write-Host "Warning: failed to create Alpha TimeBack task with ScheduledTasks cmdlets: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-  }
-
-  $schtasksPath = "$env:windir\System32\schtasks.exe"
-  if (-not (Test-Path $schtasksPath)) { $schtasksPath = 'schtasks.exe' }
-  try {
-    Start-Process -FilePath $schtasksPath -ArgumentList '/Delete','/TN',$taskName,'/F' -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue | Out-Null
-    $trCmd = "cmd.exe $cmdArgs"
-    $trArg = '"' + $trCmd + '"'
-    $p = Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$userId,'/RL','LIMITED','/IT','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop
-    if ($p.ExitCode -eq 0) {
-      Write-Host "Created child logon task '$taskName' to install Alpha TimeBack." -ForegroundColor Green
-    } else {
-      Write-Host "Warning: schtasks returned exit code $($p.ExitCode) while creating '$taskName'." -ForegroundColor Yellow
-    }
-  } catch {
-    Write-Host "Warning: failed to create Alpha TimeBack install task via schtasks.exe: $($_.Exception.Message)" -ForegroundColor Yellow
-  }
-}
-
 function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]$ChildUserName) {
   $candidates = @()
   if ($SourceScriptPath) {
@@ -659,17 +650,20 @@ function Ensure-StudyReelInstallTask([string]$ChildUserName, [string]$InstallerP
 }
 
 function Ensure-ChildTaskbarUiLockTask([string]$ChildUserName) {
-  # Runs in child context at each sign-in to enforce taskbar distraction toggles where offline hive ACLs can block writes.
+  # Runs in child context at next sign-in to enforce taskbar distraction toggles where offline hive ACLs can block writes.
+  # Deletes itself after successful execution.
   $taskName = "ApplyChildTaskbarUi_$ChildUserName"
   $userId = "$env:COMPUTERNAME\$ChildUserName"
-  $cmd = @(
+  $cmdParts = @(
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarDa /t REG_DWORD /d 0 /f',
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarMn /t REG_DWORD /d 0 /f',
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ShowTaskViewButton /t REG_DWORD /d 0 /f',
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f',
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v IsDynamicSearchBoxEnabled /t REG_DWORD /d 0 /f',
     'reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Feeds" /v ShellFeedsTaskbarViewMode /t REG_DWORD /d 2 /f'
-  ) -join ' & '
+  )
+  $cmdParts += "schtasks /Delete /TN `"$taskName`" /F"
+  $cmd = $cmdParts -join ' & '
   $cmdArgs = "/c $cmd"
 
   if (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue) {
@@ -681,7 +675,7 @@ function Ensure-ChildTaskbarUiLockTask([string]$ChildUserName) {
       $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
       $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
       Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
-      Write-Host "Created child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
+      Write-Host "Created one-time child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
       return
     } catch {
       Write-Host "Warning: failed to create child UI task with ScheduledTasks cmdlets: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -696,7 +690,7 @@ function Ensure-ChildTaskbarUiLockTask([string]$ChildUserName) {
     $trArg = '"' + $trCmd + '"'
     $p = Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$userId,'/RL','LIMITED','/IT','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop
     if ($p.ExitCode -eq 0) {
-      Write-Host "Created child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
+      Write-Host "Created one-time child logon task '$taskName' for UI/taskbar lock settings." -ForegroundColor Green
     } else {
       Write-Host "Warning: schtasks returned exit code $($p.ExitCode) while creating '$taskName'." -ForegroundColor Yellow
     }
@@ -733,6 +727,19 @@ function Remove-AlphaTimeBackInstallTask([string]$ChildUserName) {
 
 function Remove-StudyReelInstallTask([string]$ChildUserName) {
   $taskName = "InstallStudyReel_$ChildUserName"
+  try {
+    if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
+      if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+    } else {
+      & schtasks.exe /Delete /TN $taskName /F | Out-Null
+    }
+  } catch {}
+}
+
+function Remove-FirstLogonTask([string]$ChildUserName) {
+  $taskName = "ApplyChildLockdown_$ChildUserName"
   try {
     if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
       if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
@@ -1314,8 +1321,9 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   Set-RegistryValue -Path $expl -Name 'NoDrives'      -Value $allDrives -Type DWord
   Set-RegistryValue -Path $expl -Name 'NoViewOnDrive' -Value $allDrives -Type DWord
 
-  # --- Prohibit Control Panel and Settings ---
-  Set-RegistryValue -Path $expl -Name 'NoControlPanel' -Value 1 -Type DWord
+  # --- Allow Settings app, but restrict visible pages to Wi-Fi/network only ---
+  Set-RegistryValue -Path $expl -Name 'NoControlPanel' -Value 0 -Type DWord
+  Set-RegistryValue -Path $expl -Name 'SettingsPageVisibility' -Value 'showonly:network-status;network-wifi;network-wifisettings' -Type String
 
   # --- Remove Task Manager ---
   Set-RegistryValue -Path $sys -Name 'DisableTaskMgr' -Value 1 -Type DWord
@@ -1336,7 +1344,13 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   $feedsPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Windows Feeds"
   Set-RegistryValue -Path $feedsPol -Name 'EnableFeeds' -Value 0 -Type DWord
 
-  # Per-user taskbar UI values are enforced by the child logon task (ApplyChildTaskbarUi_*).
+  # Windows location prompt toggle in child profile:
+  # "Notify when apps request location" = off.
+  $locationConsent = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+  Set-RegistryValue -Path $locationConsent -Name 'ShowGlobalPrompts' -Value 0 -Type DWord
+
+  # Per-user taskbar/search/feed UI values are applied by a one-time child logon task
+  # (offline hive ACLs can block writes under Explorer\Advanced).
 
   # "Don't run specified Windows applications" list for common bypass binaries.
   Set-RegistryValue -Path $expl -Name 'DisallowRun' -Value 1 -Type DWord
@@ -1384,6 +1398,7 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
   $winExplorerPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Explorer"
   $dshPol = "$HiveRoot\Software\Policies\Microsoft\Dsh"
   $feedsPol = "$HiveRoot\Software\Policies\Microsoft\Windows\Windows Feeds"
+  $locationConsent = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
   $explorerAdvanced = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
   $search = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Search"
   $feeds = "$HiveRoot\Software\Microsoft\Windows\CurrentVersion\Feeds"
@@ -1395,6 +1410,7 @@ function Remove-UserLockdownFromHive([string]$HiveRoot, [string]$Sid) {
 
   # Clean up non-policy values written under regular per-user locations.
   foreach ($pair in @(
+    @{ Path = $locationConsent; Name = 'ShowGlobalPrompts' },
     @{ Path = $explorerAdvanced; Name = 'TaskbarDa' },
     @{ Path = $explorerAdvanced; Name = 'TaskbarMn' },
     @{ Path = $explorerAdvanced; Name = 'ShowTaskViewButton' },
@@ -1567,10 +1583,10 @@ try {
       Close-UserHiveAccess -HiveAccess $hiveAccess
     }
 
+    Remove-FirstLogonTask -ChildUserName $UserName
     Remove-ChildTaskbarUiLockTask -ChildUserName $UserName
     Remove-AlphaTimeBackInstallTask -ChildUserName $UserName
     Remove-StudyReelInstallTask -ChildUserName $UserName
-    Write-Host "If you created a scheduled task ApplyChildLockdown_$UserName, delete it from Task Scheduler." -ForegroundColor Yellow
     return
   }
 
@@ -1579,6 +1595,20 @@ try {
   $childUser = $selection.UserName
   if (-not $childUser) { throw 'Username cannot be empty.' }
 
+  $secureTaskScriptPath = $null
+  $scriptPathForSecureCopy = $PSCommandPath
+  if (-not $scriptPathForSecureCopy) { $scriptPathForSecureCopy = $MyInvocation.MyCommand.Path }
+  if ($scriptPathForSecureCopy -and (Test-Path $scriptPathForSecureCopy)) {
+    try {
+      $secureTaskScriptPath = Ensure-SecureTaskScriptCopy -SourcePath $scriptPathForSecureCopy
+    } catch {
+      Write-Host "Warning: could not refresh secure task script copy: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host "Warning: script path was not resolvable; secure task script copy was not refreshed." -ForegroundColor Yellow
+  }
+  
+  Ensure-CurrentUserExecutionPolicyBypass
   Ensure-TaskSchedulerHistoryEnabled
   Prompt-TimeAndLocationSetup
 
@@ -1603,8 +1633,21 @@ try {
   $sid = Get-LocalUserSid $childUser
   if (-not $sid) { throw "Could not resolve SID for '$childUser'" }
 
+  # Always clean up stale scheduled tasks from prior script versions.
+  Remove-FirstLogonTask -ChildUserName $childUser
+  Remove-ChildTaskbarUiLockTask -ChildUserName $childUser
+  Remove-AlphaTimeBackInstallTask -ChildUserName $childUser
+
+  if ($selection.CreateNew) {
+    Write-Host "`nNew child account '$childUser' created." -ForegroundColor Green
+    Write-Host "Next step required before lockdown can be applied:" -ForegroundColor Cyan
+    Write-Host "1) Sign in as '$childUser' once, then sign out." -ForegroundColor Cyan
+    Write-Host "2) Run this script again and select existing user '$childUser'." -ForegroundColor Cyan
+    Write-Host "No first-logon lockdown scheduled task was created." -ForegroundColor Yellow
+    return
+  }
+
   Ensure-ChildTaskbarUiLockTask -ChildUserName $childUser
-  # Ensure-AlphaTimeBackInstallTask -ChildUserName $childUser
   $secureStudyReelInstallerPath = Ensure-SecureStudyReelInstallerCopy -SourceScriptPath $PSCommandPath -ChildUserName $childUser
   Ensure-StudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath
 
@@ -1669,10 +1712,8 @@ try {
       Apply-ChromeHardening -HiveRoot $hiveAccess.HiveRoot -RestrictSigninPatternRegex $pattern
       Apply-UserLockdownToHive -HiveRoot $hiveAccess.HiveRoot -Sid $sid
     } else {
-      Write-Host "User profile hive not found yet. The child must sign in once to create the profile." -ForegroundColor Yellow
-      Write-Host "A logon task will be created so lockdown is applied automatically at first sign-in." -ForegroundColor Yellow
-      Remove-LegacyMachineChromeHardening
-      Ensure-FirstLogonTask -ChildUserName $childUser -ChildSid $sid -RestrictSigninPatternRegex $pattern
+      Write-Host "User profile hive not found yet. Sign in once as '$childUser', sign out, then rerun this script." -ForegroundColor Yellow
+      return
     }
   } finally {
     Close-UserHiveAccess -HiveAccess $hiveAccess
@@ -1680,7 +1721,9 @@ try {
 
   Write-Host "`nDONE." -ForegroundColor Green
   $secureRoot = Ensure-SecureChildLockdownRoot
-  $secureTaskScriptPath = Join-Path (Join-Path $secureRoot 'TaskScripts') 'ApplyChildLockdown.ps1'
+  if (-not $secureTaskScriptPath) {
+    $secureTaskScriptPath = Join-Path (Join-Path $secureRoot 'TaskScripts') 'ApplyChildLockdown.ps1'
+  }
   $secureStudyReelCopyPath = Join-Path (Join-Path $secureRoot 'Installers') 'StudyReel-Installer.exe'
   Write-Host "Reusable secure path (kept until manually removed): $secureRoot" -ForegroundColor Cyan
   if (Test-Path $secureTaskScriptPath) {
@@ -1692,9 +1735,9 @@ try {
   Write-Host "Next steps (manual):" -ForegroundColor Cyan
   Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
   Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
-  Write-Host "`nRollback:" -ForegroundColor Yellow
-  Write-Host "- Remove Chrome policies:   powershell -NoProfile -ExecutionPolicy Bypass -File `"$secureTaskScriptPath`" -RemoveChromePolicies -UserName <name>" -ForegroundColor Yellow
-  Write-Host "- Remove user lockdown:     powershell -NoProfile -ExecutionPolicy Bypass -File `"$secureTaskScriptPath`" -RemoveUserLockdown -UserName <name>" -ForegroundColor Yellow
+  Write-Host "`nRollback (must be run as the administrative user):" -ForegroundColor Yellow
+  Write-Host "- Remove Chrome policies:   $secureTaskScriptPath -RemoveChromePolicies -UserName $childUser" -ForegroundColor Yellow
+  Write-Host "- Remove user lockdown:     $secureTaskScriptPath -RemoveUserLockdown -UserName $childUser" -ForegroundColor Yellow
 } finally {
   Stop-SecureTranscriptLogging
 }
