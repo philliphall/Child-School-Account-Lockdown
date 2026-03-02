@@ -107,6 +107,11 @@ function Ensure-SecureInstallerDirectory([string]$ChildUserName) {
   return $dir
 }
 
+function Get-SecureStudyReelInstallerPath([string]$ChildUserName) {
+  $installerDir = Ensure-SecureInstallerDirectory -ChildUserName $ChildUserName
+  return Join-Path $installerDir 'StudyReel-Installer.exe'
+}
+
 function Start-SecureTranscriptLogging {
   $root = Ensure-SecureChildLockdownRoot
   $logDir = Join-Path $root 'Logs'
@@ -570,6 +575,8 @@ function Remove-UnnecessaryBuiltInApps {
 }
 
 function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]$ChildUserName) {
+  $destInstaller = Get-SecureStudyReelInstallerPath -ChildUserName $ChildUserName
+
   $candidates = @()
   if ($SourceScriptPath) {
     $srcDir = Split-Path -Path $SourceScriptPath -Parent
@@ -577,6 +584,7 @@ function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]
   }
   $cwd = (Get-Location).Path
   if ($cwd) { $candidates += (Join-Path $cwd 'StudyReel-Installer.exe') }
+  if ($destInstaller) { $candidates += $destInstaller }
 
   $sourceInstaller = $null
   foreach ($candidate in @($candidates | Where-Object { $_ } | Select-Object -Unique)) {
@@ -587,14 +595,19 @@ function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]
   }
 
   if (-not $sourceInstaller) {
-    Write-Host "StudyReel installer not found next to script. Expected 'StudyReel-Installer.exe'. Skipping StudyReel install task." -ForegroundColor Yellow
+    Write-Host "StudyReel installer not found in script folder, current folder, or secure installer path. Skipping StudyReel install task." -ForegroundColor Yellow
     return $null
   }
 
-  $installerDir = Ensure-SecureInstallerDirectory -ChildUserName $ChildUserName
+  $sourceFullPath = [System.IO.Path]::GetFullPath($sourceInstaller)
+  $destFullPath = [System.IO.Path]::GetFullPath($destInstaller)
+  if ($sourceFullPath -ne $destFullPath) {
+    Copy-Item -LiteralPath $sourceInstaller -Destination $destInstaller -Force
+    Write-Host "Copied StudyReel installer to secure path: $destInstaller" -ForegroundColor Green
+  } else {
+    Write-Host "Using existing StudyReel installer at secure path: $destInstaller" -ForegroundColor DarkCyan
+  }
 
-  $destInstaller = Join-Path $installerDir 'StudyReel-Installer.exe'
-  Copy-Item -LiteralPath $sourceInstaller -Destination $destInstaller -Force
   $fileGrants = @("*S-1-5-18:(F)", "*S-1-5-32-544:(F)")
   if ($ChildUserName) {
     $sid = Get-LocalUserSid $ChildUserName
@@ -602,7 +615,6 @@ function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]
   }
   & icacls.exe $destInstaller /inheritance:r /grant:r $fileGrants /C | Out-Null
 
-  Write-Host "Copied StudyReel installer to secure path: $destInstaller" -ForegroundColor Green
   return $destInstaller
 }
 
@@ -1691,8 +1703,6 @@ try {
   Remove-ChildTaskbarUiLockTask -ChildUserName $childUser
   Remove-AlphaTimeBackInstallTask -ChildUserName $childUser
 
-  $studyReelTaskCreated = $false
-
   if ($selection.CreateNew) {
     Write-Host "`nNew child account '$childUser' created." -ForegroundColor Green
     Write-Host "Next step required before lockdown can be applied:" -ForegroundColor Cyan
@@ -1700,7 +1710,6 @@ try {
     Write-Host "2) (Recommended) While still signed in as '$childUser', install StudyReel manually." -ForegroundColor Cyan
     Write-Host "3) Sign out from '$childUser'." -ForegroundColor Cyan
     Write-Host "4) Sign back in as admin and run this script again; select existing user '$childUser'." -ForegroundColor Cyan
-    Write-Host "No first-logon lockdown scheduled task was created." -ForegroundColor Yellow
     return
   }
 
@@ -1710,7 +1719,7 @@ try {
     Write-Host "StudyReel already detected (machine-wide): $($studyReelState.MachineExePath). Skipping StudyReel install prompt/task." -ForegroundColor Green
     Remove-StudyReelInstallTask -ChildUserName $childUser
   } else {
-    $secureStudyReelInstallerPath = Ensure-SecureStudyReelInstallerCopy -SourceScriptPath $PSCommandPath -ChildUserName $childUser
+    $secureStudyReelInstallerPath = Ensure-SecureStudyReelInstallerCopy -SourceScriptPath $scriptPathForSecureCopy -ChildUserName $childUser
     if (Prompt-CreateStudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath) {
       $studyReelTaskCreated = Ensure-StudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath
     } else {
