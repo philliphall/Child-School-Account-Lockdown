@@ -13,7 +13,7 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Disable adding new profiles
    - Force browser sign-in
    - Restrict sign-in to allowed email(s)
-   - Allow approved extensions for profiles install
+   - Block extension installs by default (optional allowlist template is present but commented out)
    - Block high-risk chrome:// pages and extension installs
 4) Applies Windows per-user lockdown policies ONLY to the target child user (not admins).
    If the child has never signed in (no profile hive yet), the script exits and instructs a sign-in/sign-out,
@@ -24,8 +24,8 @@ GET THE LATEST VERSION FROM https://github.com/philliphall/Child-School-Account-
    - Removes desktop shortcuts except approved apps (Chrome + StudyReel + Alpha TimeBack) from child/Public desktop
    - Removes unapproved taskbar pinned shortcuts (best-effort)
    - Sets Chrome to auto-start at child sign-in
-6) Copies StudyReel-Installer.exe (if present next to this script) into a secure installer path and creates a
-   child-logon scheduled task (runs as the child user) to install it into that profile.
+6) Copies StudyReel-Installer.exe (if present next to this script) into a secure installer path and can
+   optionally create a child-logon scheduled task (runs as the child user) to install it into that profile.
 
 SAFETY
 - Does NOT modify Administrator account.
@@ -609,7 +609,7 @@ function Ensure-SecureStudyReelInstallerCopy([string]$SourceScriptPath, [string]
 function Ensure-StudyReelInstallTask([string]$ChildUserName, [string]$InstallerPath) {
   if (-not $InstallerPath -or -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
     Write-Host "StudyReel installer path is unavailable; skipping StudyReel install task." -ForegroundColor Yellow
-    return
+    return $false
   }
 
   $taskName = "InstallStudyReel_$ChildUserName"
@@ -626,7 +626,7 @@ function Ensure-StudyReelInstallTask([string]$ChildUserName, [string]$InstallerP
       $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
       Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
       Write-Host "Created child logon task '$taskName' to install StudyReel in the child profile." -ForegroundColor Green
-      return
+      return $true
     } catch {
       Write-Host "Warning: failed to create StudyReel install task with ScheduledTasks cmdlets: $($_.Exception.Message)" -ForegroundColor Yellow
     }
@@ -641,12 +641,26 @@ function Ensure-StudyReelInstallTask([string]$ChildUserName, [string]$InstallerP
     $p = Start-Process -FilePath $schtasksPath -ArgumentList '/Create','/TN',$taskName,'/SC','ONLOGON','/RU',$userId,'/RL','LIMITED','/IT','/TR',$trArg,'/F' -NoNewWindow -Wait -PassThru -ErrorAction Stop
     if ($p.ExitCode -eq 0) {
       Write-Host "Created child logon task '$taskName' to install StudyReel in the child profile." -ForegroundColor Green
+      return $true
     } else {
       Write-Host "Warning: schtasks returned exit code $($p.ExitCode) while creating '$taskName'." -ForegroundColor Yellow
     }
   } catch {
     Write-Host "Warning: failed to create StudyReel install task via schtasks.exe: $($_.Exception.Message)" -ForegroundColor Yellow
   }
+
+  return $false
+}
+
+function Prompt-CreateStudyReelInstallTask([string]$ChildUserName, [string]$InstallerPath) {
+  if (-not $InstallerPath -or -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+    return $false
+  }
+
+  Write-Host "`nStudyReel does not appear to be installed yet." -ForegroundColor Cyan
+  $choice = Read-Host "Would you like me to schedule install once the student logs in? (Y/N, Enter = Y)"
+  if ([string]::IsNullOrWhiteSpace($choice) -or ($choice -match '^[Yy]')) { return $true }
+  return $false
 }
 
 function Ensure-ChildTaskbarUiLockTask([string]$ChildUserName) {
@@ -763,7 +777,32 @@ function Get-ChromeExecutablePath {
   return $null
 }
 
-function Get-StudyReelExecutablePath([string]$ProfilePath) {
+function Get-StudyReelMachineExecutablePath {
+  # Prefer uninstall metadata because this installer registers all-users in Program Files.
+  $uninstallRoots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  foreach ($root in $uninstallRoots) {
+    $entries = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue | Where-Object {
+      $_.DisplayName -match '^(?i)StudyReel(\s|$)' -or $_.Publisher -match '(?i)LightCI'
+    })
+    foreach ($entry in $entries) {
+      $u = [string]$entry.UninstallString
+      if ([string]::IsNullOrWhiteSpace($u)) { continue }
+      $m = [regex]::Match($u, '"([^"]*Uninstall StudyReel\.exe)"')
+      if ($m.Success) {
+        $uninst = $m.Groups[1].Value
+        $dir = Split-Path -Path $uninst -Parent
+        if ($dir) {
+          $exe = Join-Path $dir 'StudyReel.exe'
+          if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+        }
+      }
+    }
+  }
+
+  # Fallback direct path checks.
   $patterns = @()
   if ($env:ProgramFiles) {
     $patterns += (Join-Path $env:ProgramFiles 'StudyReel\StudyReel.exe')
@@ -773,16 +812,21 @@ function Get-StudyReelExecutablePath([string]$ProfilePath) {
     $patterns += (Join-Path ${env:ProgramFiles(x86)} 'StudyReel\StudyReel.exe')
     $patterns += (Join-Path ${env:ProgramFiles(x86)} 'StudyReel\*\StudyReel.exe')
   }
-  if ($ProfilePath) {
-    $patterns += (Join-Path $ProfilePath 'AppData\Local\Programs\StudyReel\StudyReel.exe')
-    $patterns += (Join-Path $ProfilePath 'AppData\Local\StudyReel\StudyReel.exe')
-  }
-
   foreach ($pat in $patterns) {
     $hit = Get-ChildItem -Path $pat -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($hit -and (Test-Path $hit.FullName)) { return $hit.FullName }
   }
   return $null
+}
+
+function Get-StudyReelInstallStateForChild([string]$Sid) {
+  $machineExe = Get-StudyReelMachineExecutablePath
+
+  return [PSCustomObject]@{
+    MachineInstalled = [bool]$machineExe
+    MachineExePath   = $machineExe
+    IsInstalled      = [bool]$machineExe
+  }
 }
 
 function Get-AlphaTimeBackExecutableLeafNames {
@@ -890,7 +934,7 @@ function Apply-ChildShellSurfaceLockdown([string]$HiveRoot, [string]$Sid) {
 
   $childDesktop = Join-Path $profilePath 'Desktop'
   $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
-  $studyReelExe = Get-StudyReelExecutablePath -ProfilePath $profilePath
+  $studyReelExe = Get-StudyReelMachineExecutablePath
   $alphaTimeBackExeLeafNames = Get-AlphaTimeBackExecutableLeafNames
 
   # Remove public and per-user shortcuts except approved apps.
@@ -939,8 +983,6 @@ function Apply-ChromeHardening([string]$HiveRoot, [string]$RestrictSigninPattern
   Set-RegistryValue -Path $base -Name 'BrowserGuestModeEnabled'    -Value 0 -Type DWord
   # Disable Incognito (1 = disabled)
   Set-RegistryValue -Path $base -Name 'IncognitoModeAvailability'  -Value 1 -Type DWord
-  # Force browser sign-in
-  Set-RegistryValue -Path $base -Name 'ForceBrowserSignin'         -Value 1 -Type DWord
   # Browser sign-in mode (2 = force sign-in)
   Set-RegistryValue -Path $base -Name 'BrowserSignin'              -Value 2 -Type DWord
   # Lock down browser escape surfaces.
@@ -954,12 +996,15 @@ function Apply-ChromeHardening([string]$HiveRoot, [string]$RestrictSigninPattern
   $exceptSensitive = "$base\URLAllowList"
   if (Test-Path $exceptSensitive) { Remove-Item -Path $exceptSensitive -Recurse -Force -ErrorAction SilentlyContinue }
   Ensure-RegistryKey $exceptSensitive
-  Set-RegistryValue -Path $exceptSensitive -Name '1' -Value '*' -Type String
+  Set-RegistryValue -Path $exceptSensitive -Name '1' -Value 'chrome://policy' -Type String
 
 
   if ($RestrictSigninPatternRegex) {
     # Restrict to allowed account(s) using regex
     Set-RegistryValue -Path $base -Name 'RestrictSigninToPattern' -Value $RestrictSigninPatternRegex -Type String
+  } else {
+    # Explicitly clear prior restriction when operator leaves allowed-email list empty.
+    Remove-ItemProperty -Path $base -Name 'RestrictSigninToPattern' -Force -ErrorAction SilentlyContinue
   }
 
   # Block all extension installation by default.
@@ -1321,9 +1366,9 @@ function Apply-UserLockdownToHive([string]$HiveRoot, [string]$Sid) {
   Set-RegistryValue -Path $expl -Name 'NoDrives'      -Value $allDrives -Type DWord
   Set-RegistryValue -Path $expl -Name 'NoViewOnDrive' -Value $allDrives -Type DWord
 
-  # --- Allow Settings app, but restrict visible pages to Wi-Fi/network only ---
+  # --- Allow Settings app, but restrict visible pages to approved networking/display/device pages ---
   Set-RegistryValue -Path $expl -Name 'NoControlPanel' -Value 0 -Type DWord
-  Set-RegistryValue -Path $expl -Name 'SettingsPageVisibility' -Value 'showonly:network-status;network-wifi;network-wifisettings' -Type String
+  Set-RegistryValue -Path $expl -Name 'SettingsPageVisibility' -Value 'showonly:network-status;network-wifi;network-wifisettings;display;bluetooth;devices' -Type String
 
   # --- Remove Task Manager ---
   Set-RegistryValue -Path $sys -Name 'DisableTaskMgr' -Value 1 -Type DWord
@@ -1638,18 +1683,33 @@ try {
   Remove-ChildTaskbarUiLockTask -ChildUserName $childUser
   Remove-AlphaTimeBackInstallTask -ChildUserName $childUser
 
+  $studyReelTaskCreated = $false
+
   if ($selection.CreateNew) {
     Write-Host "`nNew child account '$childUser' created." -ForegroundColor Green
     Write-Host "Next step required before lockdown can be applied:" -ForegroundColor Cyan
-    Write-Host "1) Sign in as '$childUser' once, then sign out." -ForegroundColor Cyan
-    Write-Host "2) Run this script again and select existing user '$childUser'." -ForegroundColor Cyan
+    Write-Host "1) Sign in as '$childUser' once (initializes the user profile)." -ForegroundColor Cyan
+    Write-Host "2) (Recommended) While still signed in as '$childUser', install StudyReel manually." -ForegroundColor Cyan
+    Write-Host "3) Sign out from '$childUser'." -ForegroundColor Cyan
+    Write-Host "4) Sign back in as admin and run this script again; select existing user '$childUser'." -ForegroundColor Cyan
     Write-Host "No first-logon lockdown scheduled task was created." -ForegroundColor Yellow
     return
   }
 
   Ensure-ChildTaskbarUiLockTask -ChildUserName $childUser
-  $secureStudyReelInstallerPath = Ensure-SecureStudyReelInstallerCopy -SourceScriptPath $PSCommandPath -ChildUserName $childUser
-  Ensure-StudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath
+  $studyReelState = Get-StudyReelInstallStateForChild -Sid $sid
+  if ($studyReelState.IsInstalled) {
+    Write-Host "StudyReel already detected (machine-wide): $($studyReelState.MachineExePath). Skipping StudyReel install prompt/task." -ForegroundColor Green
+    Remove-StudyReelInstallTask -ChildUserName $childUser
+  } else {
+    $secureStudyReelInstallerPath = Ensure-SecureStudyReelInstallerCopy -SourceScriptPath $PSCommandPath -ChildUserName $childUser
+    if (Prompt-CreateStudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath) {
+      $studyReelTaskCreated = Ensure-StudyReelInstallTask -ChildUserName $childUser -InstallerPath $secureStudyReelInstallerPath
+    } else {
+      Remove-StudyReelInstallTask -ChildUserName $childUser
+      Write-Host "Skipping StudyReel scheduled install task (manual-first workflow)." -ForegroundColor Yellow
+    }
+  }
 
   # Chrome RestrictSigninToPattern
   Write-Host "`nChrome sign-in restriction:" -ForegroundColor Cyan
@@ -1689,6 +1749,7 @@ try {
       $emails = @($emailsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
   }
+  $emails = @($emails | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
 
   $pattern = $null
   if ($emails.Count -eq 1) {
@@ -1732,9 +1793,7 @@ try {
   if (Test-Path $secureStudyReelCopyPath) {
     Write-Host "- StudyReel installer payload path: $secureStudyReelCopyPath" -ForegroundColor Cyan
   }
-  Write-Host "Next steps (manual):" -ForegroundColor Cyan
-  Write-Host "1) Sign in as the child once (to initialize profile), then sign out." -ForegroundColor Cyan
-  Write-Host "2) In Chrome for the child: sign in with the allowed account and verify chrome://policy shows status OK." -ForegroundColor Cyan
+  Write-Host "finished." -ForegroundColor Cyan
   Write-Host "`nRollback (must be run as the administrative user):" -ForegroundColor Yellow
   Write-Host "- Remove Chrome policies:   $secureTaskScriptPath -RemoveChromePolicies -UserName $childUser" -ForegroundColor Yellow
   Write-Host "- Remove user lockdown:     $secureTaskScriptPath -RemoveUserLockdown -UserName $childUser" -ForegroundColor Yellow
