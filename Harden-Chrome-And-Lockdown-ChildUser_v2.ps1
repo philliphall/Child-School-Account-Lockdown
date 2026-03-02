@@ -785,7 +785,11 @@ function Get-StudyReelMachineExecutablePath {
   )
   foreach ($root in $uninstallRoots) {
     $entries = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue | Where-Object {
-      $_.DisplayName -match '^(?i)StudyReel(\s|$)' -or $_.Publisher -match '(?i)LightCI'
+      $dnProp = $_.PSObject.Properties['DisplayName']
+      $pubProp = $_.PSObject.Properties['Publisher']
+      $dn = if ($dnProp) { [string]$dnProp.Value } else { '' }
+      $pub = if ($pubProp) { [string]$pubProp.Value } else { '' }
+      $dn -match '^(?i)StudyReel(\s|$)' -or $pub -match '(?i)LightCI'
     })
     foreach ($entry in $entries) {
       $u = [string]$entry.UninstallString
