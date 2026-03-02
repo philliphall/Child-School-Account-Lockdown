@@ -1480,7 +1480,12 @@ function Ensure-SecureTaskScriptCopy([string]$SourcePath) {
   $taskDir = Ensure-SecureTaskScriptDirectory
 
   $destPath = Join-Path $taskDir 'ApplyChildLockdown.ps1'
-  Copy-Item -Path $SourcePath -Destination $destPath -Force
+  $sourceFullPath = [System.IO.Path]::GetFullPath($SourcePath)
+  $destFullPath = [System.IO.Path]::GetFullPath($destPath)
+
+  if ($sourceFullPath -ne $destFullPath) {
+    Copy-Item -Path $SourcePath -Destination $destPath -Force
+  }
 
   # Lock task script path to SYSTEM + local admins only.
   & icacls.exe $destPath /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /C | Out-Null
@@ -1575,6 +1580,18 @@ function Internal-ApplyUserLockdown([string]$Sid, [string]$RestrictSigninPattern
 Assert-Admin
 try {
   Start-SecureTranscriptLogging
+  $secureTaskScriptPath = $null
+  $scriptPathForSecureCopy = $PSCommandPath
+  if (-not $scriptPathForSecureCopy) { $scriptPathForSecureCopy = $MyInvocation.MyCommand.Path }
+  if ($scriptPathForSecureCopy -and (Test-Path $scriptPathForSecureCopy)) {
+    try {
+      $secureTaskScriptPath = Ensure-SecureTaskScriptCopy -SourcePath $scriptPathForSecureCopy
+    } catch {
+      Write-Host "Warning: could not refresh secure task script copy: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host "Warning: script path was not resolvable; secure task script copy was not refreshed." -ForegroundColor Yellow
+  }
 
   if ($InternalApplyUserLockdown) {
     if (-not $InternalUserSid) { throw 'Missing -InternalUserSid' }
@@ -1639,19 +1656,6 @@ try {
   $selection = Prompt-ChildUserSelection
   $childUser = $selection.UserName
   if (-not $childUser) { throw 'Username cannot be empty.' }
-
-  $secureTaskScriptPath = $null
-  $scriptPathForSecureCopy = $PSCommandPath
-  if (-not $scriptPathForSecureCopy) { $scriptPathForSecureCopy = $MyInvocation.MyCommand.Path }
-  if ($scriptPathForSecureCopy -and (Test-Path $scriptPathForSecureCopy)) {
-    try {
-      $secureTaskScriptPath = Ensure-SecureTaskScriptCopy -SourcePath $scriptPathForSecureCopy
-    } catch {
-      Write-Host "Warning: could not refresh secure task script copy: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-  } else {
-    Write-Host "Warning: script path was not resolvable; secure task script copy was not refreshed." -ForegroundColor Yellow
-  }
   
   Ensure-CurrentUserExecutionPolicyBypass
   Ensure-TaskSchedulerHistoryEnabled
